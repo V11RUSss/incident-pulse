@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="robots" content="noindex">
+  <title>Ситуационная стена — Инциденты</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='120' fill='%23E30613'/%3E%3Cpath d='M70 280H150L196 172L260 358L312 244L344 280H382' fill='none' stroke='white' stroke-width='30' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='436' cy='280' r='22' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/wall.css">
+  <script src="/wall.js" defer></script>
+</head>
+<body data-phase="overview" data-live="connecting">
+<div class="wall">
+
+  <header class="wall-header">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 512 512" aria-hidden="true" focusable="false">
+        <rect class="brand-bg" width="512" height="512" rx="120"></rect>
+        <path class="brand-pulse" d="M70 280H150L196 172L260 358L312 244L344 280H382"></path>
+        <circle class="brand-dot" cx="436" cy="280" r="22"></circle>
+      </svg>
+      <span class="brand-copy">
+        <strong>Инциденты</strong>
+        <small>Ситуационный центр · общий экран</small>
+      </span>
+      <span class="public-badge"><i class="public-dot" aria-hidden="true"></i>Публичный экран · без входа</span>
+    </div>
+    <div class="header-right">
+      <span class="update-age" id="update-age">данные ещё не получены</span>
+      <span class="live-pill" id="live-pill" role="status" aria-live="polite">
+        <i class="live-dot" aria-hidden="true"></i>
+        <span id="live-text">подключение…</span>
+      </span>
+      <div class="header-clock">
+        <div class="clock" id="clock">--:--:--</div>
+        <div class="clock-meta">
+          <span id="clock-date">—</span>
+          <span class="shift" id="shift-label">—</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <section class="summary" id="summary" aria-label="Сводка по активным инцидентам"></section>
+
+  <div class="wall-main">
+    <section class="panel panel-critical" data-panel="critical" aria-labelledby="critical-title">
+      <header class="panel-head">
+        <h2 id="critical-title">Критические и высокие</h2>
+        <span class="panel-count" id="critical-count">0</span>
+        <span class="panel-note" id="critical-note">срок SLA</span>
+      </header>
+      <div class="panel-body" id="critical-list"></div>
+      <div class="critical-foot" id="critical-summary"></div>
+    </section>
+
+    <section class="panel panel-teams" data-panel="teams" aria-labelledby="teams-title">
+      <header class="panel-head">
+        <h2 id="teams-title">В работе по командам</h2>
+        <span class="panel-count" id="teams-count">0</span>
+        <span class="panel-note">активных инцидентов</span>
+      </header>
+      <div class="panel-body" id="teams-list"></div>
+    </section>
+
+    <section class="panel panel-sla" data-panel="sla" aria-labelledby="sla-title">
+      <header class="panel-head">
+        <h2 id="sla-title">Риск SLA</h2>
+        <span class="panel-count" id="sla-count">0</span>
+        <span class="panel-note">до нарушения</span>
+      </header>
+      <div class="panel-body" id="sla-list"></div>
+    </section>
+
+    <section class="panel panel-recent" data-panel="recent" aria-labelledby="recent-title">
+      <header class="panel-head">
+        <h2 id="recent-title">Последние изменения</h2>
+        <span class="panel-count" id="recent-count">0</span>
+        <span class="panel-note">по инцидентам</span>
+      </header>
+      <div class="panel-body" id="recent-list"></div>
+    </section>
+
+    <section class="panel panel-unassigned" data-panel="unassigned" aria-labelledby="unassigned-title">
+      <header class="panel-head">
+        <h2 id="unassigned-title">Без команды</h2>
+        <span class="panel-count" id="unassigned-count">0</span>
+        <span class="panel-note">координация</span>
+      </header>
+      <div class="panel-body" id="unassigned-list"></div>
+    </section>
+  </div>
+
+  <div class="wall-bottom">
+    <section class="panel panel-products" data-panel="products" aria-labelledby="products-title">
+      <header class="panel-head">
+        <h2 id="products-title">Продукты</h2>
+        <span class="panel-count" id="products-count">0</span>
+        <span class="panel-note">затронуто пользователей</span>
+      </header>
+      <div class="panel-body" id="products-list"></div>
+    </section>
+
+    <section class="panel panel-regions" data-panel="regions" aria-labelledby="regions-title">
+      <header class="panel-head">
+        <h2 id="regions-title">Регионы</h2>
+        <span class="panel-count" id="regions-count">0</span>
+        <span class="panel-note">затронуто пользователей</span>
+      </header>
+      <div class="panel-body" id="regions-list"></div>
+    </section>
+
+    <section class="panel panel-feed" data-panel="feed" aria-labelledby="feed-title">
+      <header class="panel-head">
+        <h2 id="feed-title">Поток событий</h2>
+        <span class="panel-count" id="feed-count">0</span>
+        <span class="panel-note" id="feed-note">SSE · live</span>
+      </header>
+      <div class="panel-body" id="feed-list"></div>
+    </section>
+  </div>
+
+  <footer class="wall-footer">
+    <span class="footer-status"><i class="footer-dot" aria-hidden="true"></i><span id="footer-status-text">ожидание данных</span></span>
+    <span class="footer-focus" id="footer-focus">Фокус: обзор</span>
+    <span class="footer-rotation">Автопереключение: обзор → критические → SLA → команды <b id="phase-countdown">24 с</b></span>
+    <span class="rotation-dots" id="rotation-dots" aria-hidden="true"></span>
+  </footer>
+
+</div>
+<noscript><p class="no-js">Для отображения ситуационной стены требуется JavaScript.</p></noscript>
+</body>
+</html>

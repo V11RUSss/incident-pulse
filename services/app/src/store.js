@@ -1032,6 +1032,36 @@ class Store {
     }));
   }
 
+  // Public wallboard feed: only case-level facts, never user or coordinator
+  // identity. Personal names stay behind coordinator authentication.
+  listRecentChanges(limit = 20) {
+    const bounded = Math.min(Math.max(Number.isInteger(limit) ? limit : 20, 1), 100);
+    return this.db.prepare(`
+      SELECT h.id, h.case_id, h.action, h.created_at, c.canonical_json
+      FROM history h JOIN cases c ON c.id = h.case_id
+      ORDER BY h.id DESC LIMIT ?
+    `).all(bounded).map(row => {
+      let canonical = {};
+      try {
+        canonical = JSON.parse(row.canonical_json);
+      } catch {
+        canonical = {};
+      }
+      return {
+        id: row.id,
+        caseId: row.case_id,
+        incidentId: canonical.id || null,
+        title: canonical.title || null,
+        action: row.action,
+        status: canonical.status || null,
+        priority: canonical.priority || null,
+        priorityId: canonical.priorityId === undefined ? null : canonical.priorityId,
+        team: canonical.team || null,
+        createdAt: row.created_at
+      };
+    });
+  }
+
   recordSyncError(message) {
     this.setMetadata('syncError', message);
   }

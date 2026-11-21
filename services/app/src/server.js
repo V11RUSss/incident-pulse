@@ -115,6 +115,7 @@ const auth = new Auth(store);
 const ai = new AiClient();
 const itsm = new ItsmClient(process.env.ITSM_MOCK_URL || 'http://127.0.0.1:3001', itsmTimeoutMs);
 const eventClients = new Set();
+const wallEventClients = new Set();
 
 let operationTail = Promise.resolve();
 let pendingOperations = 0;
@@ -419,6 +420,36 @@ function openEvents(req, res, userId = null) {
   res.once('close', cleanup);
 }
 
+// The public wall has its own subscriber set: it must never enable or count
+// toward coordinator Live demo generation.
+function openWallEvents(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'X-Content-Type-Options': 'nosniff'
+  });
+  res.write('retry: 3000\n: connected\n\n');
+  const client = { res, heartbeat: null, userId: null };
+  const cleanup = () => {
+    if (!wallEventClients.has(client)) return;
+    clearInterval(client.heartbeat);
+    wallEventClients.delete(client);
+  };
+  client.heartbeat = setInterval(() => {
+    if (!res.destroyed) res.write(`: heartbeat ${Date.now()}\n\n`);
+  }, 15000);
+  wallEventClients.add(client);
+  req.once('close', cleanup);
+  res.once('close', cleanup);
+  try {
+    if (!res.destroyed) res.write(`event: wallboard\ndata: ${JSON.stringify(wallboardPayload())}\n\n`);
+  } catch {
+    res.destroy();
+  }
+}
+
 function writeEvent(client, event, data) {
   if (client.res.destroyed) return;
   try {
@@ -437,11 +468,13 @@ function broadcastIncidents(changes) {
     source: changes.source
   });
   for (const client of eventClients) writeEvent(client, 'incidents', data);
+  for (const client of wallEventClients) writeEvent(client, 'incidents', data);
 }
 
 function broadcastSync(payload) {
   const data = JSON.stringify(payload);
   for (const client of eventClients) writeEvent(client, 'sync', data);
+  for (const client of wallEventClients) writeEvent(client, 'sync', data);
 }
 
 function broadcastNotification(userId, notification, unread) {
@@ -527,6 +560,105 @@ function dashboard() {
     incidents,
     counts: countIncidents(incidents),
     ...store.getSyncState()
+  };
+}
+
+function wallCase(incident) {
+  return {
+    caseId: incident.caseId,
+    incidentId: incident.id,
+    title: incident.title,
+    product: incident.product,
+    service: incident.service,
+    region: incident.region,
+    priorityId: incident.priorityId,
+    priority: incident.priority,
+    priorityText: incident.priorityText,
+    status: incident.status,
+    stateId: incident.stateId,
+    team: incident.team,
+    startedAt: incident.startedAt,
+    dueAt: incident.dueAt,
+    affectedUsers: incident.affectedUsers,
+    reportCount: incident.reportCount,
+    isNeedUp: incident.isNeedUp,
+    groups: Array.isArray(incident.groups) ? [...incident.groups] : []
+  };
+}
+
+function compareWallQueue(a, b) {
+  const aDue = a.dueAt === null || a.dueAt === undefined ? Number.POSITIVE_INFINITY : a.dueAt;
+  const bDue = b.dueAt === null || b.dueAt === undefined ? Number.POSITIVE_INFINITY : b.dueAt;
+  if (aDue !== bDue) return aDue - bDue;
+  const byAffected = (b.affectedUsers || 0) - (a.affectedUsers || 0);
+  if (byAffected) return byAffected;
+  return String(a.caseId).localeCompare(String(b.caseId));
+}
+
+function aggregateWall(list, field) {
+  const groups = new Map();
+  for (const incident of list) {
+    const key = typeof incident[field] === 'string' ? incident[field].trim() : '';
+    if (!key) continue;
+    let entry = groups.get(key);
+    if (!entry) {
+      entry = { [field]: key, total: 0, critical: 0, high: 0, affectedUsers: 0 };
+      groups.set(key, entry);
+    }
+    entry.total += 1;
+    if (incident.groups.includes('critical')) entry.critical += 1;
+    if (incident.groups.includes('high')) entry.high += 1;
+    entry.affectedUsers += Number(incident.affectedUsers) || 0;
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.total - a.total || String(a[field]).localeCompare(String(b[field]), 'ru'))
+    .slice(0, WALL_LIST_LIMIT);
+}
+
+// Public wallboard: aggregate, read-only, and free of coordinator identity.
+function wallboardPayload() {
+  const generatedAt = Date.now();
+  const incidents = store.listCases();
+  const active = incidents.filter(incident => (
+    Array.isArray(incident.groups) && incident.groups.includes('active')
+  ));
+  const sync = store.getSyncState();
+  const critical = active
+    .filter(incident => incident.groups.includes('critical'))
+    .sort(compareWallQueue)
+    .slice(0, WALL_LIST_LIMIT)
+    .map(wallCase);
+  const high = active
+    .filter(incident => incident.groups.includes('high'))
+    .sort(compareWallQueue)
+    .slice(0, WALL_LIST_LIMIT)
+    .map(wallCase);
+  const slaRisk = active
+    .filter(incident => incident.dueAt !== null && incident.dueAt !== undefined &&
+      incident.dueAt <= generatedAt + SLA_RISK_WINDOW_MS)
+    .sort(compareWallQueue)
+    .slice(0, WALL_LIST_LIMIT)
+    .map(incident => ({ ...wallCase(incident), remainingMs: incident.dueAt - generatedAt }));
+  const unassignedAll = active.filter(incident => !incident.team).sort(compareWallQueue);
+  const recent = store.listRecentChanges(WALL_RECENT_LIMIT);
+
+  return {
+    generatedAt,
+    live: sync.syncError === null,
+    sync,
+    counts: countIncidents(incidents, generatedAt),
+    critical,
+    high,
+    teams: aggregateWall(active, 'team'),
+    slaRisk,
+    unassigned: {
+      count: unassignedAll.length,
+      cases: unassignedAll.slice(0, WALL_LIST_LIMIT).map(wallCase)
+    },
+    products: aggregateWall(active, 'product'),
+    regions: aggregateWall(active, 'region'),
+    recent,
+    recentChanges: recent
   };
 }
 
@@ -733,6 +865,8 @@ function decodeCaseId(value) {
 }
 
 const SLA_RISK_WINDOW_MS = 15 * 60 * 1000;
+const WALL_LIST_LIMIT = 20;
+const WALL_RECENT_LIMIT = 12;
 const MAX_AI_ATTENTIONS = 20;
 const MAX_AI_HISTORY = 30;
 const MAX_AI_DETAILS_LENGTH = 1000;
@@ -1263,6 +1397,11 @@ async function handleApi(req, res, pathname, search = '') {
     return;
   }
 
+  if (req.method === 'GET' && pathname === '/api/v1/wallboard') {
+    sendJson(res, 200, wallboardPayload());
+    return;
+  }
+
   const session = requireUser(req);
 
   if (req.method === 'GET' && pathname === '/api/v1/auth/me') {
@@ -1654,6 +1793,15 @@ async function handleRequest(req, res) {
     await handleApi(req, res, pathname, parsedUrl.search);
     return;
   }
+  if (pathname === '/wall/events') {
+    if (req.method !== 'GET') throw new HttpError('Метод не поддерживается', 405);
+    openWallEvents(req, res);
+    return;
+  }
+  if (pathname === '/wall' || pathname === '/wall/') {
+    await serveStatic(req, res, '/wall.html');
+    return;
+  }
   if (pathname === '/itsm' || pathname.startsWith('/itsm/')) {
     requireUser(req);
     await proxyItsm(req, res, pathname, parsedUrl.search);
@@ -1686,6 +1834,11 @@ function shutdown() {
     client.res.end();
   }
   eventClients.clear();
+  for (const client of wallEventClients) {
+    clearInterval(client.heartbeat);
+    client.res.end();
+  }
+  wallEventClients.clear();
   const forceTimer = setTimeout(() => {
     server.closeAllConnections();
     closeStore();

@@ -11,6 +11,7 @@ COPY services/app/package.json ./package.json
 COPY services/app/lib ./lib
 COPY services/app/src ./src
 COPY index.html app.js styles.css /web/
+COPY wall.html wall.js wall.css /web/
 COPY theme.js /web/
 
 RUN chmod -R a+rX /app /web \

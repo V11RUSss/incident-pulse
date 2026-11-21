@@ -108,6 +108,11 @@ const state = {
     reportSignature: null,
     merge: null
   },
+  view: 'our',
+  assigned: {
+    updated: new Map(),
+    loading: new Set()
+  },
   admin: { users: [], audit: [], system: null, tab: 'users', confirmTimer: null },
   assistant: {
     open: false,
@@ -200,6 +205,16 @@ const elements = {
   notificationList: document.querySelector('#notification-list'),
   notificationEmpty: document.querySelector('#notification-empty'),
   notificationReadAll: document.querySelector('#notification-read-all'),
+  workspaceTabOur: document.querySelector('#workspace-tab-our'),
+  workspaceTabAssigned: document.querySelector('#workspace-tab-assigned'),
+  workspacePaneOur: document.querySelector('#workspace-pane-our'),
+  workspacePaneAssigned: document.querySelector('#workspace-pane-assigned'),
+  assignedSummary: document.querySelector('#assigned-summary'),
+  assignedList: document.querySelector('#assigned-list'),
+  assignedEmpty: document.querySelector('#assigned-empty'),
+  unacceptedCount: document.querySelector('#unaccepted-count'),
+  unacceptedList: document.querySelector('#unaccepted-list'),
+  unacceptedEmpty: document.querySelector('#unaccepted-empty'),
   triageChip: document.querySelector('#triage-chip'),
   triagePanel: document.querySelector('#triage-panel'),
   triageTitle: document.querySelector('#triage-title'),
@@ -561,6 +576,7 @@ function setUser(user) {
 }
 
 function handleUnauthorized() {
+  setWorkspaceView('our');
   closeEvents();
   resetAssistantUi();
   resetRoutingUi();
@@ -652,6 +668,7 @@ function queueRefresh(options) {
 }
 
 async function enterDashboard() {
+  setWorkspaceView('our');
   showView('dashboard');
   await loadMeta();
   await loadCoordinators();
@@ -835,6 +852,7 @@ function renderNotifications() {
   bell.setAttribute('aria-label', unread ? `Уведомления: ${unread} новых` : 'Уведомления');
   if (elements.notificationReadAll) elements.notificationReadAll.disabled = unread === 0;
   renderNotificationList();
+  renderAssignedView();
 }
 
 function openNotificationPanel() {
@@ -1774,7 +1792,246 @@ function resetTriage() {
   renderTriageChip();
 }
 
-/* --------------------------------------------------------------- rendering */
+/* ------------------------------------------------------------ workspaces */
+
+function setWorkspaceView(view, options = {}) {
+  const next = view === 'assigned' ? 'assigned' : 'our';
+  state.view = next;
+  if (elements.workspacePaneOur) elements.workspacePaneOur.hidden = next !== 'our';
+  if (elements.workspacePaneAssigned) elements.workspacePaneAssigned.hidden = next !== 'assigned';
+  const tabs = [
+    ['our', elements.workspaceTabOur],
+    ['assigned', elements.workspaceTabAssigned]
+  ];
+  for (const [name, tab] of tabs) {
+    if (!tab) continue;
+    const active = name === next;
+    tab.classList.toggle('is-active', active);
+    tab.setAttribute('aria-selected', String(active));
+    tab.tabIndex = active ? 0 : -1;
+  }
+  if (next === 'assigned') {
+    if (!state.notifications.loaded) loadNotifications();
+    renderAssignedView();
+  }
+  if (options.focusTab) {
+    const tab = next === 'assigned' ? elements.workspaceTabAssigned : elements.workspaceTabOur;
+    if (tab) tab.focus({ preventScroll: true });
+  }
+}
+
+function onWorkspaceTabKeydown(event) {
+  if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft' && event.key !== 'Home' && event.key !== 'End') return;
+  event.preventDefault();
+  if (event.key === 'Home') setWorkspaceView('our', { focusTab: true });
+  else if (event.key === 'End') setWorkspaceView('assigned', { focusTab: true });
+  else setWorkspaceView(state.view === 'our' ? 'assigned' : 'our', { focusTab: true });
+}
+
+function assignedIncidents() {
+  if (!state.user) return [];
+  const userId = String(state.user.id);
+  return state.incidents
+    .filter(incident => String(incident.coordinatorId || '') === userId)
+    .sort(compareIncidents);
+}
+
+function assignedDirectUpdated(incident) {
+  const value = incident.updatedAt ?? incident.updated_at ?? incident.lastUpdatedAt;
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) && value > 0 ? value : null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function loadAssignedUpdated(incident) {
+  const caseId = String(incident.caseId);
+  if (state.assigned.loading.has(caseId)) return;
+  const cached = state.assigned.updated.get(caseId);
+  if (cached && cached.version === incident.version) return;
+  state.assigned.loading.add(caseId);
+  try {
+    const data = await api('/api/v1/incidents/' + encodeURIComponent(caseId) + '/history');
+    const history = Array.isArray(data.history) ? data.history : [];
+    let at = null;
+    for (const entry of history) {
+      const created = Number(entry.createdAt);
+      if (Number.isFinite(created) && (at === null || created > at)) at = created;
+    }
+    state.assigned.updated.set(caseId, { version: incident.version, at });
+  } catch (error) {
+    if (error.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+    state.assigned.updated.set(caseId, { version: incident.version, at: null });
+  } finally {
+    state.assigned.loading.delete(caseId);
+    if (state.view === 'assigned') renderAssignedView();
+  }
+}
+
+function assignedIncidentNode(incident) {
+  const item = document.createElement('li');
+  item.className = 'assigned-item';
+  const head = document.createElement('div');
+  head.className = 'assigned-item-head';
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'assigned-open';
+  open.dataset.assignedOpen = String(incident.caseId);
+  open.setAttribute('aria-label', 'Открыть инцидент ' + incident.id);
+  const id = document.createElement('span');
+  id.className = 'assigned-id';
+  id.textContent = incident.id;
+  const title = document.createElement('strong');
+  title.className = 'assigned-title';
+  title.textContent = incident.title;
+  open.append(id, title);
+  head.append(open);
+  const sla = getSla(incident);
+  const slaBadge = document.createElement('span');
+  slaBadge.className = 'assigned-sla ' + toneClass(sla.tone);
+  slaBadge.title = sla.label;
+  slaBadge.textContent = 'SLA ' + sla.value;
+  head.append(slaBadge);
+  item.append(head);
+  const fields = document.createElement('dl');
+  fields.className = 'assigned-fields';
+  const addField = (label, value) => {
+    const group = document.createElement('div');
+    const term = document.createElement('dt');
+    term.textContent = label;
+    const detail = document.createElement('dd');
+    detail.textContent = value;
+    group.append(term, detail);
+    fields.append(group);
+  };
+  addField('Приоритет', incident.priorityText || priorityLabel(incident.priorityId));
+  addField('Команда', incident.team || '—');
+  addField('Статус', incident.status);
+  addField('SLA', sla.value + ' · ' + sla.label);
+  const direct = assignedDirectUpdated(incident);
+  const cached = state.assigned.updated.get(String(incident.caseId));
+  const hasCached = cached && cached.version === incident.version;
+  const updated = direct !== null ? direct : hasCached ? cached.at : null;
+  const updatedText = direct !== null || hasCached
+    ? (updated === null ? '—' : formatRelative(updated))
+    : '…';
+  addField('Обновлён', updatedText);
+  item.append(fields);
+  return item;
+}
+
+function unacceptedAssignments() {
+  return state.notifications.items.filter(notification =>
+    notification.type === 'coordinator_assigned' && !notification.readAt
+  );
+}
+
+function unacceptedAssignmentNode(notification) {
+  const item = document.createElement('li');
+  item.className = 'unaccepted-item';
+  const copy = document.createElement('div');
+  copy.className = 'unaccepted-copy';
+  const title = document.createElement('strong');
+  title.textContent = notification.title || 'Назначение координатору';
+  copy.append(title);
+  if (notification.message) {
+    const message = document.createElement('span');
+    message.textContent = notification.message;
+    copy.append(message);
+  }
+  const time = document.createElement('time');
+  const timestamp = notificationTimestamp(notification.createdAt);
+  if (timestamp !== null) {
+    time.dateTime = new Date(timestamp).toISOString();
+    time.textContent = formatRelative(timestamp);
+  }
+  copy.append(time);
+  item.append(copy);
+  const actions = document.createElement('div');
+  actions.className = 'unaccepted-actions';
+  const accept = document.createElement('button');
+  accept.type = 'button';
+  accept.className = 'button button-primary button-sm';
+  accept.textContent = 'Принять';
+  accept.dataset.acceptNotification = String(notification.id);
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.className = 'button button-secondary button-sm';
+  open.textContent = 'Открыть';
+  const identifier = notification.caseId || notification.incidentId || '';
+  open.dataset.assignedOpen = String(identifier);
+  open.disabled = !identifier;
+  actions.append(accept, open);
+  item.append(actions);
+  return item;
+}
+
+function renderUnacceptedAssignments() {
+  const list = elements.unacceptedList;
+  if (!list) return;
+  const items = unacceptedAssignments();
+  if (elements.unacceptedCount) elements.unacceptedCount.textContent = String(items.length);
+  list.replaceChildren();
+  for (const notification of items) list.append(unacceptedAssignmentNode(notification));
+  if (elements.unacceptedEmpty) elements.unacceptedEmpty.hidden = items.length > 0;
+}
+
+function renderAssignedView() {
+  if (state.view !== 'assigned' || !elements.workspacePaneAssigned) return;
+  const incidents = assignedIncidents();
+  const summary = incidents.length
+    ? incidents.length + ' ' + plural(incidents.length, 'инцидент', 'инцидента', 'инцидентов') + ' назначено вам'
+    : 'Назначений нет';
+  if (elements.assignedSummary) elements.assignedSummary.textContent = summary;
+  const list = elements.assignedList;
+  if (list) {
+    list.replaceChildren();
+    for (const incident of incidents) {
+      list.append(assignedIncidentNode(incident));
+      const direct = assignedDirectUpdated(incident);
+      const cached = state.assigned.updated.get(String(incident.caseId));
+      const hasCached = cached && cached.version === incident.version;
+      if (direct === null && !hasCached) loadAssignedUpdated(incident);
+    }
+  }
+  if (elements.assignedEmpty) elements.assignedEmpty.hidden = incidents.length > 0;
+  renderUnacceptedAssignments();
+}
+
+async function acceptAssignedNotification(button) {
+  const id = button && button.dataset ? button.dataset.acceptNotification : null;
+  if (!id) return;
+  const notification = state.notifications.items.find(item => String(item.id) === String(id));
+  if (!notification || notification.readAt) return;
+  button.disabled = true;
+  await markNotificationRead(notification);
+  if (state.view === 'assigned') renderAssignedView();
+}
+
+function openAssignedIncident(identifier) {
+  const key = identifier === null || identifier === undefined ? '' : String(identifier);
+  if (!key) return;
+  const incident = state.incidents.find(item => String(item.caseId) === key || String(item.id) === key);
+  if (!incident) {
+    showToast('Кейс недоступен', 'Кейс не найден в текущем списке', false);
+    return;
+  }
+  openIncident(incident.caseId);
+}
+
+function onAssignedPaneClick(event) {
+  const accept = event.target.closest('[data-accept-notification]');
+  if (accept) {
+    acceptAssignedNotification(accept);
+    return;
+  }
+  const open = event.target.closest('[data-assigned-open]');
+  if (open) openAssignedIncident(open.dataset.assignedOpen);
+}
+
 /* --------------------------------------------------------------- rendering */
 
 
@@ -2119,6 +2376,7 @@ function render() {
     populateDialog(findIncident(state.activeId), { resetInputs: false });
   }
   updateCountdowns();
+  renderAssignedView();
   restoreFocus(focus);
 }
 
@@ -4010,6 +4268,7 @@ async function logout() {
   }
   closeEvents();
   setUser(null);
+  setWorkspaceView('our');
   resetNotifications();
   resetTriage();
   state.incidents = [];
@@ -4111,6 +4370,12 @@ function bindEvents() {
   elements.notificationBell.addEventListener('click', toggleNotificationPanel);
   elements.notificationReadAll.addEventListener('click', markAllNotificationsRead);
   elements.notificationList.addEventListener('click', onNotificationClick);
+
+  elements.workspaceTabOur.addEventListener('click', () => setWorkspaceView('our'));
+  elements.workspaceTabAssigned.addEventListener('click', () => setWorkspaceView('assigned'));
+  elements.workspaceTabOur.addEventListener('keydown', onWorkspaceTabKeydown);
+  elements.workspaceTabAssigned.addEventListener('keydown', onWorkspaceTabKeydown);
+  elements.workspacePaneAssigned.addEventListener('click', onAssignedPaneClick);
 
   elements.triageChip.addEventListener('click', toggleTriagePanel);
   elements.triageClose.addEventListener('click', () => closeTriagePanel());
