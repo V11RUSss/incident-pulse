@@ -736,6 +736,39 @@ const SLA_RISK_WINDOW_MS = 15 * 60 * 1000;
 const MAX_AI_ATTENTIONS = 20;
 const MAX_AI_HISTORY = 30;
 const MAX_AI_DETAILS_LENGTH = 1000;
+const AI_TIME_ZONE = 'Europe/Moscow';
+const AI_TIME_FORMATTER = new Intl.DateTimeFormat('ru-RU', {
+  timeZone: AI_TIME_ZONE,
+  day: '2-digit',
+  month: '2-digit',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  hour12: false
+});
+const AI_TIME_RULES = 'Формат дат: ДД.ММ.ГГГГ ЧЧ:ММ МСК. Не выводи сырые числовые таймстемпы (epoch) и не пересчитывай даты самостоятельно.';
+
+function aiTimeLabel(timestamp) {
+  if (timestamp === null || timestamp === undefined || timestamp === '') return null;
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  return `${AI_TIME_FORMATTER.format(date).replace(',', '')} МСК`;
+}
+
+function promptCase(brief) {
+  return {
+    ...brief,
+    startedAt: aiTimeLabel(brief.startedAt),
+    dueAt: aiTimeLabel(brief.dueAt)
+  };
+}
+
+function promptHistoryDetails(details) {
+  if (!details || typeof details !== 'object' || Array.isArray(details)) return details;
+  const formatted = { ...details };
+  if (Object.hasOwn(formatted, 'deadline')) formatted.deadline = aiTimeLabel(formatted.deadline);
+  return formatted;
+}
 
 function incidentBrief(incident) {
   return {
@@ -786,12 +819,13 @@ function buildDashboardPrompt(data) {
   const incidents = Array.isArray(data.incidents) ? data.incidents : [];
   const lines = [
     'Составь краткую общую сводку по текущим инцидентам координатора: сколько активных/критических/research/SLA, затронутых пользователей, и три приоритетных внимания.',
-    'Текущее время (epoch ms):',
-    String(Date.now()),
+    AI_TIME_RULES,
+    'Текущее время:',
+    aiTimeLabel(Date.now()),
     'Счётчики:',
     JSON.stringify(data.counts || {}),
     'Наиболее приоритетные/SLA-рисковые/массовые активные инциденты:',
-    JSON.stringify(topCases(incidents))
+    JSON.stringify(topCases(incidents).map(promptCase))
   ];
   return lines.join('\n');
 }
@@ -799,24 +833,27 @@ function buildDashboardPrompt(data) {
 function buildIncidentPrompt(incident, history) {
   const lines = [
     'Составь сводку по инциденту: ситуация, динамика, SLA, рекомендуемая команда/действие.',
-    'Текущее время (epoch ms):',
-    String(Date.now()),
+    AI_TIME_RULES,
+    'Текущее время:',
+    aiTimeLabel(Date.now()),
     'Данные инцидента:',
     JSON.stringify({
       ...incidentBrief(incident),
+      startedAt: aiTimeLabel(incident.startedAt),
+      dueAt: aiTimeLabel(incident.dueAt),
       description: incident.description,
       scenario: incident.scenario,
       prioritySource: incident.prioritySource,
       groups: incident.groups,
-      resolvedAt: incident.resolvedAt,
+      resolvedAt: aiTimeLabel(incident.resolvedAt),
       solution: incident.solution
     }),
     'История изменений (новые записи первыми):',
     JSON.stringify((history || []).slice(0, MAX_AI_HISTORY).map(item => ({
       action: item.action,
       user: item.userName,
-      at: item.createdAt,
-      details: compactDetails(item.details)
+      at: aiTimeLabel(item.createdAt),
+      details: compactDetails(promptHistoryDetails(item.details))
     })))
   ];
   return lines.join('\n');

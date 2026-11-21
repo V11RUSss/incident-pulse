@@ -132,10 +132,20 @@ test('resetSyncState clears cases and history and accepts a fresh snapshot', (t)
     details: {}
   });
   assert.equal(store.listHistory(caseId).length, 1);
+  store.createNotification({
+    userId: 'u1',
+    caseId,
+    incidentId: 'MTS-TEST-0001',
+    type: 'coordinator_assigned',
+    title: 'Вам назначен инцидент',
+    message: 'MTS-TEST-0001 · Тестовый инцидент'
+  });
+  assert.equal(store.listNotifications('u1').length, 1);
   store.resetSyncState();
   assert.equal(store.listCases().length, 0);
   assert.equal(store.getCurrentRevision(), 0);
   assert.equal(store.listHistory(caseId).length, 0);
+  assert.equal(store.listNotifications('u1').length, 0);
   const result = store.applyDelta([raw({ version: 2, affectedUsers: 600 })], 9);
   assert.equal(result.added, 1);
   assert.equal(store.getCurrentRevision(), 9);

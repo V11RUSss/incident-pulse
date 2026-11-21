@@ -897,6 +897,9 @@ class Store {
       this.db.exec('DELETE FROM case_merges;');
       this.db.exec('DELETE FROM raw_incidents;');
       this.db.exec('DELETE FROM cases;');
+      // Notifications point at cases that no longer exist after a reset or a
+      // full re-read; keeping them leaves dead items in the bell.
+      this.db.exec('DELETE FROM notifications;');
       this.db.exec('DELETE FROM correlation_overrides;');
       this.db.exec('DELETE FROM case_key_aliases;');
       this.setMetadata('itsmRevision', '0');

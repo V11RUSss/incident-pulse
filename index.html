@@ -145,22 +145,22 @@
       <article class="summary-card summary-card--critical">
         <strong class="summary-num" id="critical-count">0</strong>
         <span class="summary-label">Критические</span>
-        <span class="summary-sub">всего <b id="critical-total">0</b></span>
+        <span class="summary-sub">всего в системе <b id="critical-total">0</b></span>
       </article>
       <article class="summary-card summary-card--coordinator">
         <strong class="summary-num" id="coordination-count">0</strong>
         <span class="summary-label">На координаторов</span>
-        <span class="summary-sub">всего <b id="coordination-total">0</b></span>
+        <span class="summary-sub">всего в системе <b id="coordination-total">0</b></span>
       </article>
       <article class="summary-card summary-card--high">
         <strong class="summary-num" id="high-count">0</strong>
         <span class="summary-label">Высокий приоритет</span>
-        <span class="summary-sub">всего <b id="high-total">0</b></span>
+        <span class="summary-sub">всего в системе <b id="high-total">0</b></span>
       </article>
       <article class="summary-card summary-card--research">
         <strong class="summary-num" id="research-count">0</strong>
         <span class="summary-label">Исследование</span>
-        <span class="summary-sub">всего <b id="research-total">0</b></span>
+        <span class="summary-sub">всего в системе <b id="research-total">0</b></span>
       </article>
       <article class="summary-card summary-card--active">
         <strong class="summary-num" id="total-count">0</strong>
@@ -312,7 +312,7 @@
           <h2 id="in-progress-title">В работе</h2>
           <span class="group-count" id="group-count-in-progress">0</span>
         </div>
-        <p>Средний и низкий приоритет с назначенной командой</p>
+        <p>Активные кейсы с назначенной командой, включая высокий и критический приоритет</p>
       </header>
       <ul class="in-progress-list" id="list-in-progress" role="list"></ul>
     </section>
@@ -357,10 +357,9 @@
         <div class="actions-grid" id="incident-actions">
           <section class="action-section" id="section-coordinator" aria-labelledby="coordinator-actions-title">
             <h3 id="coordinator-actions-title">Координатор</h3>
-            <button class="button button-secondary" id="claim-button" type="button">Взять в координацию</button>
             <form id="reassign-form" class="action-form" data-action-form>
               <label for="coordinator-select">Передать координатору</label>
-              <select id="coordinator-select" name="coordinatorId" required></select>
+              <select id="coordinator-select" name="coordinatorId"></select>
               <button class="button button-secondary" type="submit">Переназначить</button>
             </form>
           </section>
@@ -409,7 +408,7 @@
             <p class="action-hint">После назначения инцидент переходит в работу и уходит с координации. Срок SLA считается от момента возникновения и не продлевается автоматически — изменить его можно в блоке «Срок SLA».</p>
             <form id="team-form" class="action-form" data-action-form>
               <label for="team-select">Команда МТС</label>
-              <select id="team-select" name="team" required></select>
+              <select id="team-select" name="team"></select>
               <button class="button button-secondary" type="submit">Назначить команду</button>
             </form>
           </section>

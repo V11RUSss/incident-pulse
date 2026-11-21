@@ -67,19 +67,25 @@ test('mock patch keeps version and updatedAt immutable', async (t) => {
   }
 });
 
-test('mock patch accepts valid known fields and unknown fields', async (t) => {
-  const { store } = await makeStore(t);
+test('mock patch accepts valid known fields and rejects unknown fields', async (t) => {
+  const { store, StoreError } = await makeStore(t);
   const result = await store.patch('MTS-MOBILE-0001', {
     affectedUsers: 1000,
     isNeedUp: true,
-    assignedGroupName: null,
-    customField: 'allowed'
+    assignedGroupName: null
   });
   assert.equal(result.updated, 1);
   assert.equal(result.incident.affectedUsers, 1000);
   assert.equal(result.incident.isNeedUp, true);
-  assert.equal(result.incident.customField, 'allowed');
+  assert.equal(Object.hasOwn(result.incident, 'customField'), false);
   assert.ok(result.incident.version > 1);
+
+  assert.throws(() => store.patch('MTS-MOBILE-0001', { customField: 'allowed' }), (error) => {
+    assert.equal(error instanceof StoreError, true);
+    assert.equal(error.statusCode, 400);
+    assert.equal(error.message, 'Patch field customField is not supported');
+    return true;
+  });
 });
 
 test('mock snapshot reports revision_ahead with current revision', async (t) => {

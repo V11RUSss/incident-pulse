@@ -3155,7 +3155,9 @@ function toLocalInputValue(milliseconds) {
 function ensureOption(select, value) {
   if (!select) return;
   if (value === null || value === undefined || value === '') {
-    select.value = '';
+    // Сохраняем выбор координатора, ещё не отправленный на сервер, но не оставляем
+    // селект без выбранной подписи: пустое значение — это placeholder.
+    if (select.selectedIndex < 0) select.selectedIndex = 0;
     return;
   }
   const stringValue = String(value);
@@ -3166,13 +3168,6 @@ function ensureOption(select, value) {
     select.appendChild(option);
   }
   select.value = stringValue;
-}
-
-function updateClaimButton(incident) {
-  const claim = document.querySelector('#claim-button');
-  const claimedByMe = incident.coordinatorId === (state.user ? state.user.id : null);
-  claim.disabled = claimedByMe;
-  claim.textContent = claimedByMe ? 'Вы — координатор' : 'Взять в координацию';
 }
 
 function updateTakeWorkButton(incident) {
@@ -3222,6 +3217,12 @@ function populateCoordinatorSelect(incident) {
     select.value = '';
     return;
   }
+  const placeholder = document.createElement('option');
+  placeholder.value = '';
+  placeholder.textContent = 'Выберите координатора';
+  placeholder.disabled = true;
+  placeholder.selected = true;
+  select.appendChild(placeholder);
   state.coordinators.forEach(coordinator => {
     const option = document.createElement('option');
     option.value = coordinator.id;
@@ -3242,8 +3243,9 @@ function populateTeamSelect(incident) {
   const select = document.querySelector('#team-select');
   const teams = [...teamOptions()];
   if (incident.team && !teams.includes(incident.team)) teams.unshift(incident.team);
-  select.innerHTML = teams.map(team => `<option value="${escapeHtml(team)}">${escapeHtml(team)}</option>`).join('');
-  select.value = incident.team || teams[0];
+  select.innerHTML = '<option value="" disabled selected>Выберите команду</option>'
+    + teams.map(team => `<option value="${escapeHtml(team)}">${escapeHtml(team)}</option>`).join('');
+  select.value = incident.team || '';
 }
 
 function updateSolutionField(value) {
@@ -3313,7 +3315,6 @@ function clearDialogMessages() {
 
 function populateActions(incident, { resetInputs = false } = {}) {
   setActionVisibility(incident);
-  updateClaimButton(incident);
   updateTakeWorkButton(incident);
   populatePriorityInfo(incident);
   if (resetInputs) {
@@ -3380,12 +3381,12 @@ function currentIncident() {
 }
 
 function setDialogBusy(busy) {
-  document.querySelectorAll('#incident-actions button, #claim-button').forEach(button => {
+  document.querySelectorAll('#incident-actions button').forEach(button => {
     button.disabled = busy;
   });
   if (!busy) {
     const incident = currentIncident();
-    if (incident) updateClaimButton(incident);
+    if (incident) updateTakeWorkButton(incident);
   }
 }
 
@@ -3600,7 +3601,11 @@ async function submitReassign(event) {
   const incident = currentIncident();
   if (!incident) return;
   const coordinatorId = document.querySelector('#coordinator-select').value;
-  if (!coordinatorId) return;
+  if (!coordinatorId) {
+    clearDialogMessages();
+    showDialogError(new Error('Выберите координатора, чтобы передать инцидент'));
+    return;
+  }
   await performAction(incident, 'coordinator', { coordinatorId });
 }
 
@@ -3628,7 +3633,11 @@ async function submitTeam(event) {
   const incident = currentIncident();
   if (!incident) return;
   const team = document.querySelector('#team-select').value;
-  if (!team) return;
+  if (!team) {
+    clearDialogMessages();
+    showDialogError(new Error('Выберите команду, чтобы назначить её инциденту'));
+    return;
+  }
   const success = await performAction(incident, 'team', { team });
   if (!success) return;
   elements.dialog.close();
@@ -3642,12 +3651,6 @@ async function submitStatus(event) {
   const stateId = Number(document.querySelector('#status-select').value);
   const solution = document.querySelector('#solution-input').value.trim() || null;
   await performAction(incident, 'status', { stateId, solution });
-}
-
-async function claimIncident() {
-  const incident = currentIncident();
-  if (!incident) return;
-  await performAction(incident, 'claim', {});
 }
 
 async function takeIncidentToWork() {
@@ -4150,7 +4153,6 @@ function bindEvents() {
     elements.toast.hidden = true;
   });
 
-  document.querySelector('#claim-button').addEventListener('click', claimIncident);
   document.querySelector('#reassign-form').addEventListener('submit', submitReassign);
   document.querySelector('#priority-form').addEventListener('submit', submitPriority);
   document.querySelector('#priority-auto-button').addEventListener('click', clearPriorityOverride);

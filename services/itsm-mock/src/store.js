@@ -38,6 +38,23 @@ const PATCH_BOOLEAN_FIELDS = [
   'isReason',
   'isRootIncident',
 ];
+// Exactly the fields the app sends through bulk-update plus the record fields the
+// mock itself supports and validates. Anything else is rejected instead of being
+// merged into the record.
+const PATCH_ALLOWED_FIELDS = new Set([
+  'id',
+  'stateId',
+  'priorityId',
+  'priorityOverrideId',
+  'affectedUsers',
+  'reportCount',
+  'submitDate',
+  'deadline',
+  'completionDate',
+  ...PATCH_STRING_FIELDS,
+  ...PATCH_NULLABLE_STRING_FIELDS,
+  ...PATCH_BOOLEAN_FIELDS,
+]);
 
 function isIsoDate(value) {
   return typeof value === 'string' &&
@@ -47,6 +64,14 @@ function isIsoDate(value) {
 
 function invalidPatchField(field, expectation) {
   throw new StoreError(400, `Patch field ${field} ${expectation}`);
+}
+
+function rejectUnsupportedPatchFields(patch) {
+  for (const field of Object.keys(patch)) {
+    if (!PATCH_ALLOWED_FIELDS.has(field)) {
+      invalidPatchField(field, 'is not supported');
+    }
+  }
 }
 
 function validatePatch(patch) {
@@ -95,6 +120,7 @@ function normalizePatch(payload) {
   if (Object.hasOwn(payload, 'version') || Object.hasOwn(payload, 'updatedAt')) {
     throw new StoreError(400, 'version and updatedAt are managed by the ITSM mock');
   }
+  rejectUnsupportedPatchFields(payload);
   validatePatch(payload);
   return structuredClone(payload);
 }
