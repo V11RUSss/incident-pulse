@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#0a0d12" id="theme-color">
-  <title>Инциденты в фокусе — Центр координации МТС</title>
+  <title>Инциденты — Центр координации МТС</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='120' fill='%23E30613'/%3E%3Cpath d='M70 280H150L196 172L260 358L312 244L344 280H382' fill='none' stroke='white' stroke-width='30' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='436' cy='280' r='22' fill='white'/%3E%3C/svg%3E">
   <script src="theme.js"></script>
   <link rel="stylesheet" href="styles.css">
@@ -126,11 +126,10 @@
   </main>
 
   <main class="main-content" id="dashboard-view" hidden>
-    <section class="page-heading" aria-labelledby="dashboard-title">
+    <section class="page-heading page-heading--compact" aria-labelledby="dashboard-title">
       <div class="page-heading-copy">
         <p class="eyebrow">Центр координации · МТС</p>
-        <h1 id="dashboard-title" tabindex="-1">Инциденты в фокусе</h1>
-        <p class="page-subtitle">Главное по массовым инцидентам — на одном экране</p>
+        <h1 class="visually-hidden" id="dashboard-title" tabindex="-1">Инциденты</h1>
       </div>
       <div class="heading-actions">
         <button class="button button-primary" id="sync-button" type="button">
@@ -175,9 +174,9 @@
         <svg class="icon" aria-hidden="true"><use href="#i-clock"></use></svg>
         Риск SLA <strong id="risk-count">0</strong>
       </span>
-      <button class="data-chip data-chip--action quality-chip" id="quality-chip" type="button" aria-controls="quality-panel" aria-expanded="false" hidden>
-        <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
-        Качество <strong id="quality-chip-count">0</strong>
+      <button class="data-chip data-chip--action triage-chip" id="triage-chip" type="button" aria-controls="triage-panel" aria-expanded="false" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-layers"></use></svg>
+        Дубли <strong id="triage-chip-count">0</strong>
       </button>
       <button class="data-chip data-chip--action" id="in-progress-jump" type="button" aria-controls="in-progress-view" hidden>
         <svg class="icon" aria-hidden="true"><use href="#i-forward"></use></svg>
@@ -231,6 +230,11 @@
         <input id="risk-filter" type="checkbox">
         <span class="checkbox-mark" aria-hidden="true"><svg class="icon"><use href="#i-check"></use></svg></span>
         Только с риском SLA
+      </label>
+      <label class="risk-filter" for="coordinator-filter">
+        <input id="coordinator-filter" type="checkbox">
+        <span class="checkbox-mark" aria-hidden="true"><svg class="icon"><use href="#i-check"></use></svg></span>
+        Без координатора
       </label>
       <button class="button button-secondary" id="archive-button" type="button" aria-pressed="false">
         <svg class="icon" aria-hidden="true"><use href="#i-box"></use></svg>
@@ -344,97 +348,12 @@
         <div class="dialog-badges" id="dialog-badges"></div>
         <h2 id="dialog-title" tabindex="-1"></h2>
         <p class="dialog-product" id="dialog-product"></p>
-        <p class="dialog-description" id="dialog-description"></p>
 
-        <section class="dialog-sla" id="dialog-sla" aria-label="Срок решения">
-          <div class="dialog-sla-top">
-            <span class="summary-icon" aria-hidden="true"><svg class="icon"><use href="#i-clock"></use></svg></span>
-            <div><span id="dialog-sla-label">До нарушения SLA</span><strong id="dialog-sla-value"></strong></div>
-            <span class="dialog-sla-date" id="dialog-sla-date"></span>
-          </div>
-          <div class="sla-track" aria-hidden="true"><span class="sla-fill" id="dialog-sla-bar"></span></div>
-        </section>
-
-        <dl class="incident-details">
-          <div><dt>Статус</dt><dd id="dialog-status"></dd></div>
-          <div><dt>Приоритет</dt><dd id="dialog-priority"></dd></div>
-          <div><dt>Возник</dt><dd id="dialog-started"></dd></div>
-          <div><dt>Завершён</dt><dd id="dialog-resolved"></dd></div>
-          <div><dt>Координатор</dt><dd id="dialog-coordinator"></dd></div>
-          <div><dt>Команда</dt><dd id="dialog-team"></dd></div>
-          <div><dt>Источники</dt><dd id="dialog-sources"></dd></div>
-          <div><dt>Затронуто</dt><dd id="dialog-affected"></dd></div>
-          <div><dt>Обращения</dt><dd id="dialog-reports"></dd></div>
-          <div><dt>Регион</dt><dd id="dialog-region"></dd></div>
-        </dl>
-
-        <section class="ai-panel" id="ai-panel" aria-labelledby="ai-title">
-          <header class="ai-header">
-            <span class="ai-icon" aria-hidden="true"><svg class="icon"><use href="#i-sparkles"></use></svg></span>
-            <div><h3 id="ai-title">ИИ-анализ</h3><p>Сводка по запросу, без изменения инцидента</p></div>
-            <span class="ai-label" id="ai-label">Не запрошена</span>
-          </header>
-          <div class="ai-actions">
-            <button class="button button-secondary ai-request" id="ai-button" type="button">Получить сводку</button>
-            <button class="button button-secondary ai-request" id="postmortem-button" type="button" disabled>
-              <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
-              <span id="postmortem-button-label">Постмортем</span>
-            </button>
-          </div>
-          <p class="ai-status" id="ai-status" role="status" hidden></p>
-          <p class="ai-summary" id="ai-summary">Сводка ещё не запрошена</p>
-          <p class="ai-note" id="ai-note" hidden></p>
-          <div class="ai-recommendation" id="ai-recommendation" hidden>
-            <span>Рекомендация и внимание</span>
-            <strong id="ai-team"></strong>
-            <p id="ai-reason"></p>
-          </div>
-        </section>
-
-        <section class="postmortem-panel" id="postmortem-panel" aria-labelledby="postmortem-title" hidden>
-          <header class="postmortem-header">
-            <div>
-              <p class="eyebrow">Ретро</p>
-              <h3 id="postmortem-title">Постмортем</h3>
-            </div>
-            <span class="postmortem-source" id="postmortem-source"></span>
-            <div class="postmortem-actions">
-              <button class="button button-secondary button-sm" id="postmortem-copy" type="button">Скопировать</button>
-              <button class="button button-secondary button-sm" id="postmortem-download" type="button">Скачать .md</button>
-              <button class="icon-button" id="postmortem-close" type="button" aria-label="Закрыть постмортем">
-                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
-              </button>
-            </div>
-          </header>
-          <p class="postmortem-status" id="postmortem-status" role="status" hidden></p>
-          <div class="postmortem-content" id="postmortem-content" hidden>
-            <section class="postmortem-section">
-              <h4>Что произошло</h4>
-              <p id="postmortem-summary"></p>
-            </section>
-            <section class="postmortem-section">
-              <h4>Таймлайн</h4>
-              <ol class="postmortem-timeline" id="postmortem-timeline"></ol>
-            </section>
-            <section class="postmortem-section">
-              <h4>Почему</h4>
-              <ul class="postmortem-list" id="postmortem-causes"></ul>
-            </section>
-            <section class="postmortem-section">
-              <h4>Что улучшить</h4>
-              <ul class="postmortem-list" id="postmortem-improvements"></ul>
-            </section>
-            <section class="postmortem-section" id="postmortem-wentwell-section" hidden>
-              <h4>Что прошло хорошо</h4>
-              <ul class="postmortem-list" id="postmortem-wentwell"></ul>
-            </section>
-            <section class="postmortem-section" id="postmortem-questions-section" hidden>
-              <h4>Открытые вопросы</h4>
-              <ul class="postmortem-list" id="postmortem-questions"></ul>
-            </section>
-          </div>
-        </section>
-
+        <div class="dialog-columns">
+          <div class="dialog-main">
+        <section class="dialog-section dialog-section--settings" aria-labelledby="dialog-settings-title">
+          <h3 class="dialog-section-title" id="dialog-settings-title">Настройки</h3>
+          <button class="button button-primary take-work-button" id="take-work-button" type="button">Взять в работу</button>
         <div class="actions-grid" id="incident-actions">
           <section class="action-section" id="section-coordinator" aria-labelledby="coordinator-actions-title">
             <h3 id="coordinator-actions-title">Координатор</h3>
@@ -487,7 +406,7 @@
               </div>
             </div>
             <p class="routing-status" id="routing-status" role="status" hidden></p>
-            <p class="action-hint">После назначения инцидент переходит в работу и уходит с координации.</p>
+            <p class="action-hint">После назначения инцидент переходит в работу и уходит с координации. Срок SLA считается от момента возникновения и не продлевается автоматически — изменить его можно в блоке «Срок SLA».</p>
             <form id="team-form" class="action-form" data-action-form>
               <label for="team-select">Команда МТС</label>
               <select id="team-select" name="team" required></select>
@@ -511,14 +430,122 @@
 
           <p class="readonly-note" id="readonly-note" hidden>Инцидент завершён и находится в архиве.</p>
         </div>
-
         <p class="form-error" id="dialog-error" role="alert" hidden></p>
         <p class="dialog-success" id="dialog-success" role="status" hidden></p>
+        </section>
 
+        <section class="dialog-section" aria-labelledby="dialog-info-title">
+          <h3 class="dialog-section-title" id="dialog-info-title">Информация</h3>
+        <p class="dialog-description" id="dialog-description"></p>
+        <section class="dialog-sla" id="dialog-sla" aria-label="Срок решения">
+          <div class="dialog-sla-top">
+            <span class="summary-icon" aria-hidden="true"><svg class="icon"><use href="#i-clock"></use></svg></span>
+            <div><span id="dialog-sla-label">До нарушения SLA</span><strong id="dialog-sla-value"></strong></div>
+            <span class="dialog-sla-date" id="dialog-sla-date"></span>
+          </div>
+          <div class="sla-track" aria-hidden="true"><span class="sla-fill" id="dialog-sla-bar"></span></div>
+        </section>
+        <dl class="incident-details">
+          <div><dt>Статус</dt><dd id="dialog-status"></dd></div>
+          <div><dt>Приоритет</dt><dd id="dialog-priority"></dd></div>
+          <div><dt>Возник</dt><dd id="dialog-started"></dd></div>
+          <div><dt>Завершён</dt><dd id="dialog-resolved"></dd></div>
+          <div><dt>Координатор</dt><dd id="dialog-coordinator"></dd></div>
+          <div><dt>Команда</dt><dd id="dialog-team"></dd></div>
+          <div><dt>Источники</dt><dd id="dialog-sources"></dd></div>
+          <div><dt>Затронуто</dt><dd id="dialog-affected"></dd></div>
+          <div><dt>Обращения</dt><dd id="dialog-reports"></dd></div>
+          <div><dt>Регион</dt><dd id="dialog-region"></dd></div>
+        </dl>
+        </section>
+          </div>
+          <aside class="dialog-side" aria-label="ИИ, история и похожие кейсы">
         <section class="history-panel" aria-labelledby="history-title">
           <header><h3 id="history-title">История изменений</h3><button class="button button-secondary button-sm" id="history-refresh" type="button">Обновить</button></header>
           <ol class="history-list" id="history-list" role="list"></ol>
         </section>
+        <section class="triage-case-panel" id="triage-case-panel" aria-labelledby="triage-case-title" hidden>
+          <header class="triage-case-header">
+            <span class="triage-case-icon" aria-hidden="true"><svg class="icon"><use href="#i-layers"></use></svg></span>
+            <div>
+              <h3 id="triage-case-title">Похожие</h3>
+              <p id="triage-case-summary"></p>
+            </div>
+            <span class="triage-source" id="triage-case-source">Правила</span>
+          </header>
+          <ul class="triage-case-list" id="triage-case-list" role="list"></ul>
+          <p class="triage-case-empty" id="triage-case-empty" hidden>Похожих кейсов не найдено.</p>
+          <div class="triage-case-actions">
+            <button class="button button-secondary button-sm" id="triage-case-open" type="button">Открыть дубли</button>
+          </div>
+        </section>
+        <section class="ai-panel" id="ai-panel" aria-labelledby="ai-title">
+          <header class="ai-header">
+            <span class="ai-icon" aria-hidden="true"><svg class="icon"><use href="#i-sparkles"></use></svg></span>
+            <div><h3 id="ai-title">ИИ-анализ</h3><p>Сводка по запросу, без изменения инцидента</p></div>
+            <span class="ai-label" id="ai-label">Не запрошена</span>
+          </header>
+          <div class="ai-actions">
+            <button class="button button-secondary ai-request" id="ai-button" type="button">Получить сводку</button>
+            <button class="button button-secondary ai-request" id="postmortem-button" type="button" disabled>
+              <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+              <span id="postmortem-button-label">Постмортем</span>
+            </button>
+          </div>
+          <p class="ai-status" id="ai-status" role="status" hidden></p>
+          <p class="ai-summary" id="ai-summary">Сводка ещё не запрошена</p>
+          <p class="ai-note" id="ai-note" hidden></p>
+          <div class="ai-recommendation" id="ai-recommendation" hidden>
+            <span>Рекомендация и внимание</span>
+            <strong id="ai-team"></strong>
+            <p id="ai-reason"></p>
+          </div>
+        </section>
+        <section class="postmortem-panel" id="postmortem-panel" aria-labelledby="postmortem-title" hidden>
+          <header class="postmortem-header">
+            <div>
+              <p class="eyebrow">Ретро</p>
+              <h3 id="postmortem-title">Постмортем</h3>
+            </div>
+            <span class="postmortem-source" id="postmortem-source"></span>
+            <div class="postmortem-actions">
+              <button class="button button-secondary button-sm" id="postmortem-copy" type="button">Скопировать</button>
+              <button class="button button-secondary button-sm" id="postmortem-download" type="button">Скачать .md</button>
+              <button class="icon-button" id="postmortem-close" type="button" aria-label="Закрыть постмортем">
+                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+              </button>
+            </div>
+          </header>
+          <p class="postmortem-status" id="postmortem-status" role="status" hidden></p>
+          <div class="postmortem-content" id="postmortem-content" hidden>
+            <section class="postmortem-section">
+              <h4>Что произошло</h4>
+              <p id="postmortem-summary"></p>
+            </section>
+            <section class="postmortem-section">
+              <h4>Таймлайн</h4>
+              <ol class="postmortem-timeline" id="postmortem-timeline"></ol>
+            </section>
+            <section class="postmortem-section">
+              <h4>Почему</h4>
+              <ul class="postmortem-list" id="postmortem-causes"></ul>
+            </section>
+            <section class="postmortem-section">
+              <h4>Что улучшить</h4>
+              <ul class="postmortem-list" id="postmortem-improvements"></ul>
+            </section>
+            <section class="postmortem-section" id="postmortem-wentwell-section" hidden>
+              <h4>Что прошло хорошо</h4>
+              <ul class="postmortem-list" id="postmortem-wentwell"></ul>
+            </section>
+            <section class="postmortem-section" id="postmortem-questions-section" hidden>
+              <h4>Открытые вопросы</h4>
+              <ul class="postmortem-list" id="postmortem-questions"></ul>
+            </section>
+          </div>
+        </section>
+          </aside>
+        </div>
       </div>
       <footer class="dialog-actions">
         <a class="button button-secondary" id="itsm-link" href="/itsm/incidents" target="_blank" rel="noopener noreferrer">
@@ -564,11 +591,9 @@
           <p class="form-error" id="admin-system-error" role="alert" hidden></p>
           <div class="admin-actions">
             <button class="button button-secondary" id="admin-sync" type="button">Синхронизировать</button>
-            <button class="button button-secondary" id="admin-tick" type="button">Следующий шаг демо</button>
-            <button class="button button-primary" id="admin-critical" type="button">Смоделировать критический</button>
             <button class="button button-danger" id="admin-reset" type="button" data-confirm="0">Сбросить демо</button>
           </div>
-          <p class="admin-hint">Шаг демо продвигает сценарий ITSM. «Смоделировать критический» создаёт новую критическую запись. «Сбросить демо» очищает эмулятор и локальные кейсы — действие необратимо.</p>
+          <p class="admin-hint">Генерация событий — только Live или кнопка «Синхронизировать» на дашборде. «Сбросить демо» стирает mock-базу и локальные кейсы/историю; пользователи и настройки сохраняются.</p>
         </section>
 
         <section class="admin-panel" data-admin-panel="audit" role="tabpanel" aria-label="Журнал действий" hidden>
@@ -627,63 +652,71 @@
     <p class="routing-panel-hint">Подсказка не назначает команду. Нажмите «Назначить» или откройте инцидент.</p>
   </aside>
 
-  <aside class="quality-panel" id="quality-panel" aria-labelledby="quality-title" hidden>
-    <header class="quality-panel-header">
+
+
+  <aside class="triage-panel" id="triage-panel" aria-labelledby="triage-title" hidden>
+    <header class="triage-panel-header">
       <div>
-        <p class="eyebrow">Качество данных</p>
-        <h2 id="quality-title" tabindex="-1">Качество инцидентов</h2>
+        <p class="eyebrow">Слияние кейсов</p>
+        <h2 id="triage-title" tabindex="-1">Дубли</h2>
       </div>
-      <button class="icon-button" id="quality-close" type="button" aria-label="Закрыть панель качества">
+      <button class="icon-button" id="triage-close" type="button" aria-label="Закрыть панель дублей">
         <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
       </button>
     </header>
-    <div class="quality-panel-body">
-      <section class="quality-score-block" aria-label="Оценка качества">
-        <div class="quality-ring-wrap" id="quality-ring-wrap">
-          <svg class="quality-ring" viewBox="0 0 80 80" aria-hidden="true">
-            <circle class="quality-ring-track" cx="40" cy="40" r="34"></circle>
-            <circle class="quality-ring-value" id="quality-ring-value" cx="40" cy="40" r="34"></circle>
-          </svg>
-          <span class="quality-score-value" id="quality-score">—</span>
+    <div class="triage-panel-body">
+      <div class="triage-meta">
+        <div class="triage-meta-copy">
+          <strong id="triage-summary">Групп дублей нет</strong>
+          <span id="triage-scanned"></span>
         </div>
-        <div class="quality-score-copy">
-          <strong class="quality-status" id="quality-status">Нет данных</strong>
-          <p class="quality-verdict" id="quality-verdict">Отчёт о качестве ещё не загружен.</p>
-          <p class="quality-meta" id="quality-meta"></p>
-        </div>
-      </section>
-
-      <div class="quality-counts" aria-label="Проблемы по важности">
-        <span class="quality-count quality-count--high">Высокие <strong id="quality-count-high">0</strong></span>
-        <span class="quality-count quality-count--medium">Средние <strong id="quality-count-medium">0</strong></span>
-        <span class="quality-count quality-count--low">Низкие <strong id="quality-count-low">0</strong></span>
-        <span class="quality-source" id="quality-source">Правила</span>
+        <span class="triage-source" id="triage-source">Правила</span>
       </div>
 
-      <div class="quality-ai">
-        <button class="button button-secondary quality-ai-button" id="quality-ai-button" type="button" hidden>
-          <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
-          <span id="quality-ai-label">Проверить смысл</span>
-        </button>
-        <p class="quality-ai-status" id="quality-ai-status" aria-live="polite" hidden></p>
-        <p class="quality-generated" id="quality-generated"></p>
+      <div class="triage-ai">
+        <p class="triage-ai-status" id="triage-ai-status" aria-live="polite" hidden></p>
+        <p class="triage-generated" id="triage-generated"></p>
       </div>
 
-      <p class="quality-truncated" id="quality-truncated" hidden>Показаны не все кейсы — выборка ограничена.</p>
+      <p class="triage-truncated" id="triage-truncated" hidden>Показаны не все кандидаты — выборка ограничена.</p>
 
-      <div class="quality-focus" id="quality-focus" hidden>
-        <span>Кейс: <strong id="quality-focus-case"></strong></span>
-        <button class="quality-focus-clear" id="quality-focus-clear" type="button">Показать все</button>
+      <div class="triage-focus" id="triage-focus" hidden>
+        <span>Кейс: <strong id="triage-focus-case"></strong></span>
+        <button class="triage-focus-clear" id="triage-focus-clear" type="button">Показать все</button>
       </div>
 
-      <div class="quality-filters" id="quality-filters" role="group" aria-label="Фильтр по типу проблемы"></div>
-
-      <ul class="quality-findings" id="quality-findings" role="list"></ul>
-      <p class="quality-empty" id="quality-empty" hidden>Проблем качества не найдено.</p>
-      <p class="quality-error" id="quality-error" role="alert" hidden></p>
+      <ul class="triage-list" id="triage-list" role="list"></ul>
+      <p class="triage-empty" id="triage-empty" hidden>Групп дублей не найдено.</p>
+      <p class="triage-error" id="triage-error" role="alert" hidden></p>
     </div>
-    <p class="quality-panel-hint">Проверка правил выполняется автоматически. «Проверить смысл» запускает ИИ-разбор и не изменяет инциденты.</p>
+    <p class="triage-panel-hint">Объединение переносит источники, историю и уведомления в целевой кейс и необратимо. Команда целевого кейса сохраняется.</p>
   </aside>
+
+  <dialog class="merge-dialog" id="merge-dialog" aria-labelledby="merge-title">
+    <div class="confirm-layout">
+      <header class="confirm-header">
+        <div>
+          <p class="eyebrow">Дубли</p>
+          <h2 id="merge-title">Объединение кейсов</h2>
+        </div>
+        <button class="icon-button" id="merge-close" type="button" aria-label="Закрыть слияние">
+          <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+        </button>
+      </header>
+      <div class="confirm-body">
+        <p class="confirm-subtitle" id="merge-subtitle"></p>
+        <div class="merge-options" id="merge-options" role="radiogroup" aria-label="Целевой кейс"></div>
+        <p class="merge-warning" id="merge-warning" hidden></p>
+        <p class="merge-note" id="merge-note"></p>
+        <p class="form-error" id="merge-error" role="alert" hidden></p>
+      </div>
+      <footer class="confirm-actions">
+        <button class="button button-secondary" id="merge-cancel" type="button">Отмена</button>
+        <button class="button button-primary" id="merge-confirm" type="button">Объединить кейсы</button>
+      </footer>
+    </div>
+  </dialog>
+
 
   <div class="toast" id="toast" role="status" aria-label="Уведомления" hidden>
     <span class="toast-icon"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg></span>

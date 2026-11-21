@@ -11,6 +11,7 @@ const {
   correlationKey,
   incidentId,
   integer,
+  nullableText,
   validateRawBatch
 } = require('../lib/incidents');
 
@@ -46,6 +47,77 @@ function notificationView(row) {
   };
 }
 
+const CORRELATION_KEY_PATTERN = /^[a-z0-9][a-z0-9._-]{0,127}$/;
+const FALLBACK_KEY_PREFIX = 'id:';
+
+function invalidKeyError(message) {
+  const error = new ValidationError(message);
+  error.code = 'invalid_correlation_key';
+  return error;
+}
+
+function validateCorrelationKey(value) {
+  const key = typeof value === 'string' ? value.trim() : '';
+  if (!key) throw invalidKeyError('correlationKey обязателен');
+  if (key.startsWith(FALLBACK_KEY_PREFIX)) {
+    throw invalidKeyError('correlationKey не должен начинаться с id: — это зарезервированный fallback-префикс');
+  }
+  if (!CORRELATION_KEY_PATTERN.test(key)) {
+    throw invalidKeyError(
+      'correlationKey должен быть slug из строчных латинских букв, цифр, точки, дефиса или подчёркивания длиной до 128 символов'
+    );
+  }
+  return key;
+}
+
+function caseLifecycle(canonical) {
+  const groups = canonical && Array.isArray(canonical.groups) ? canonical.groups : null;
+  if (!groups) return 'unknown';
+  if (groups.includes('closed')) return 'closed';
+  if (groups.includes('active')) return 'active';
+  if (groups.includes('research')) return 'research';
+  return 'unknown';
+}
+
+function notFoundError(message) {
+  const error = new ValidationError(message);
+  error.status = 404;
+  return error;
+}
+
+function conflictError(message, code = null) {
+  const error = new ValidationError(message);
+  error.status = 409;
+  if (code) error.code = code;
+  return error;
+}
+
+function isOpenCaseRow(row) {
+  try {
+    const canonical = JSON.parse(row.canonical_json);
+    if (!Array.isArray(canonical.groups)) return true;
+    const lifecycle = caseLifecycle(canonical);
+    return lifecycle === 'active' || lifecycle === 'research';
+  } catch {
+    return false;
+  }
+}
+
+function mergeRowView(row) {
+  return {
+    id: row.id,
+    targetCaseId: row.target_case_id,
+    sourceCaseId: row.source_case_id,
+    sourceKey: row.source_key,
+    targetKey: row.target_key,
+    rawCount: row.raw_count,
+    userId: row.user_id,
+    userName: row.user_name,
+    createdAt: row.created_at,
+    details: row.details_json ? JSON.parse(row.details_json) : {}
+  };
+}
+
 class Store {
   constructor(dataDir) {
     fs.mkdirSync(dataDir, { recursive: true });
@@ -77,6 +149,7 @@ class Store {
         id TEXT PRIMARY KEY,
         correlation_key TEXT NOT NULL,
         priority_override_id INTEGER,
+        team_override TEXT,
         version INTEGER NOT NULL DEFAULT 0,
         canonical_json TEXT NOT NULL,
         created_at INTEGER NOT NULL,
@@ -136,8 +209,40 @@ class Store {
       );
       CREATE INDEX IF NOT EXISTS notifications_user_id_idx ON notifications(user_id, id DESC);
       CREATE INDEX IF NOT EXISTS notifications_read_at_idx ON notifications(user_id, read_at);
+
+      CREATE TABLE IF NOT EXISTS case_merges (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_case_id TEXT NOT NULL,
+        source_case_id TEXT NOT NULL,
+        source_key TEXT,
+        target_key TEXT,
+        raw_count INTEGER NOT NULL DEFAULT 0,
+        user_id TEXT,
+        user_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        details_json TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS case_merges_target_idx ON case_merges(target_case_id, id DESC);
+      CREATE INDEX IF NOT EXISTS case_merges_source_idx ON case_merges(source_case_id, id DESC);
+
+      CREATE TABLE IF NOT EXISTS correlation_overrides (
+        raw_incident_id TEXT PRIMARY KEY REFERENCES raw_incidents(id) ON DELETE CASCADE,
+        correlation_key TEXT NOT NULL,
+        user_id TEXT,
+        user_name TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS correlation_overrides_key_idx ON correlation_overrides(correlation_key);
+
+      CREATE TABLE IF NOT EXISTS case_key_aliases (
+        correlation_key TEXT PRIMARY KEY,
+        case_id TEXT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS case_key_aliases_case_idx ON case_key_aliases(case_id);
     `);
     this.ensureUserRoleColumn();
+    this.ensureCaseTeamOverrideColumn();
     this.ensureAdmin();
     this.ensureCanonicalVersion();
   }
@@ -146,6 +251,13 @@ class Store {
     const columns = this.db.prepare('PRAGMA table_info(users)').all().map(column => column.name);
     if (!columns.includes('role')) {
       this.db.exec("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'coordinator';");
+    }
+  }
+
+  ensureCaseTeamOverrideColumn() {
+    const columns = this.db.prepare('PRAGMA table_info(cases)').all().map(column => column.name);
+    if (!columns.includes('team_override')) {
+      this.db.exec('ALTER TABLE cases ADD COLUMN team_override TEXT;');
     }
   }
 
@@ -349,37 +461,59 @@ class Store {
       .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0) || a.id.localeCompare(b.id));
   }
 
+  countActiveCases() {
+    return this.listCases()
+      .filter(incident => Array.isArray(incident.groups) && incident.groups.includes('active'))
+      .length;
+  }
+
   getCurrentRevision() {
     const value = Number(this.getMetadata('itsmRevision'));
     return Number.isSafeInteger(value) && value >= 0 ? value : 0;
   }
 
+  getCorrelationOverride(incidentIdValue) {
+    const row = this.db.prepare(
+      'SELECT correlation_key FROM correlation_overrides WHERE raw_incident_id = ?'
+    ).get(String(incidentIdValue));
+    return row ? row.correlation_key : null;
+  }
+
+  effectiveCorrelationKey(raw) {
+    return this.getCorrelationOverride(incidentId(raw)) || correlationKey(raw);
+  }
+
   findOpenCase(key) {
+    const value = key === null || key === undefined ? '' : String(key);
+    if (!value) return null;
+    // A merged-away key is remembered as an alias of the surviving case, so new
+    // records that still carry the old correlation key join the target case.
+    const alias = this.db.prepare(`
+      SELECT c.id, c.canonical_json FROM case_key_aliases a
+      JOIN cases c ON c.id = a.case_id
+      WHERE a.correlation_key = ?
+    `).get(value);
+    if (alias && isOpenCaseRow(alias)) return alias.id;
     const rows = this.db.prepare(`
       SELECT id, canonical_json FROM cases WHERE correlation_key = ? ORDER BY created_at, id
-    `).all(key);
+    `).all(value);
     for (const row of rows) {
-      let canonical;
-      try {
-        canonical = JSON.parse(row.canonical_json);
-      } catch {
-        continue;
-      }
       // A freshly created case still holds the '{}' placeholder until the next
       // rebuild, so it must count as open for subsequent records in the same delta.
-      if (!Array.isArray(canonical.groups) || !canonical.groups.includes('closed')) return row.id;
+      if (isOpenCaseRow(row)) return row.id;
     }
     return null;
   }
 
-  createCase(raw, now) {
+  createCase(raw, now, key = null) {
     const id = crypto.randomUUID();
     const override = integer(raw.priorityOverrideId);
+    const caseKey = key === null ? this.effectiveCorrelationKey(raw) : key;
     this.db.prepare(`
       INSERT INTO cases (
         id, correlation_key, priority_override_id, version, canonical_json, created_at, updated_at
       ) VALUES (?, ?, ?, 0, '{}', ?, ?)
-    `).run(id, correlationKey(raw), override, now, now);
+    `).run(id, caseKey, override, now, now);
     return id;
   }
 
@@ -421,6 +555,17 @@ class Store {
         priorityOverrideId: override,
         version: row.version
       });
+      // A manual merge keeps the surviving case's team even when the merged
+      // records would otherwise become the canonical primary.
+      if (row.team_override !== null && row.team_override !== undefined) {
+        const team = nullableText(row.team_override);
+        const groups = canonical.groups.filter(group => group !== 'coordination');
+        if (canonical.groups.includes('active') &&
+            canonical.priorityId !== 4 && canonical.priorityId !== 3 && !team) {
+          groups.push('coordination');
+        }
+        canonical = { ...canonical, team, groups };
+      }
       if (previousSignature !== canonicalSignature(canonical)) {
         canonical = { ...canonical, version: row.version + 1 };
       }
@@ -432,11 +577,328 @@ class Store {
     return result;
   }
 
+  listCaseMerges(caseId = null, limit = 50) {
+    const bounded = Math.min(Math.max(Number.isInteger(limit) ? limit : 50, 1), 200);
+    if (caseId === null || caseId === undefined) {
+      return this.db.prepare('SELECT * FROM case_merges ORDER BY id DESC LIMIT ?')
+        .all(bounded)
+        .map(mergeRowView);
+    }
+    return this.db.prepare(`
+      SELECT * FROM case_merges
+      WHERE target_case_id = ? OR source_case_id = ?
+      ORDER BY id DESC LIMIT ?
+    `).all(String(caseId), String(caseId), bounded).map(mergeRowView);
+  }
+
+  mergeCases(targetId, sourceId, actor) {
+    return this.mergeCasesBatch(targetId, [sourceId], actor);
+  }
+
+  mergeCasesBatch(targetId, sourceIds, actor) {
+    const targetCaseId = String(targetId === null || targetId === undefined ? '' : targetId);
+    const sourceCaseIds = [];
+    const seenSourceIds = new Set();
+    for (const value of Array.isArray(sourceIds) ? sourceIds : [sourceIds]) {
+      const sourceCaseId = String(value === null || value === undefined ? '' : value);
+      if (!sourceCaseId) {
+        throw new ValidationError('sourceIds должен содержать непустые идентификаторы');
+      }
+      if (sourceCaseId === targetCaseId) {
+        throw new ValidationError('Нельзя объединить инцидент с самим собой');
+      }
+      if (!seenSourceIds.has(sourceCaseId)) {
+        seenSourceIds.add(sourceCaseId);
+        sourceCaseIds.push(sourceCaseId);
+      }
+    }
+    if (!targetCaseId) throw new ValidationError('targetId обязателен');
+    if (!sourceCaseIds.length) throw new ValidationError('sourceIds обязателен');
+    if (!actor || !actor.id || !actor.name) throw new ValidationError('actor обязателен');
+
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      const targetRow = this.db.prepare('SELECT * FROM cases WHERE id = ?').get(targetCaseId);
+      if (!targetRow) throw notFoundError('Целевой инцидент не найден');
+
+      const target = JSON.parse(targetRow.canonical_json);
+      const targetLifecycle = caseLifecycle(target);
+      if (targetLifecycle === 'closed') {
+        throw conflictError('Нельзя объединять закрытые инциденты', 'case_closed');
+      }
+      if (targetLifecycle === 'unknown') {
+        throw conflictError('Инцидент ещё не синхронизирован; повторите после синхронизации', 'case_not_open');
+      }
+      if (targetLifecycle !== 'active' && targetLifecycle !== 'research') {
+        throw conflictError('Объединять можно только активные или research инциденты', 'case_not_open');
+      }
+
+      // Validate every source before mutating anything: the batch is atomic.
+      const now = Date.now();
+      const sources = [];
+      for (const sourceCaseId of sourceCaseIds) {
+        const sourceRow = this.db.prepare('SELECT * FROM cases WHERE id = ?').get(sourceCaseId);
+        if (!sourceRow) throw notFoundError('Исходный инцидент не найден: ' + sourceCaseId);
+        const source = JSON.parse(sourceRow.canonical_json);
+        const sourceLifecycle = caseLifecycle(source);
+        if (sourceLifecycle === 'closed') {
+          throw conflictError('Нельзя объединять закрытые инциденты', 'case_closed');
+        }
+        if (sourceLifecycle === 'unknown') {
+          throw conflictError('Инцидент ещё не синхронизирован; повторите после синхронизации', 'case_not_open');
+        }
+        if (sourceLifecycle !== targetLifecycle) {
+          throw conflictError(
+            'Объединять можно только инциденты одного жизненного цикла (active+active или research+research)',
+            'lifecycle_mismatch'
+          );
+        }
+        const rawRows = this.db.prepare('SELECT id FROM raw_incidents WHERE case_id = ?').all(sourceCaseId);
+        if (!rawRows.length) {
+          throw conflictError('Исходный инцидент не содержит записей: ' + sourceCaseId, 'empty_case');
+        }
+        sources.push({ sourceCaseId, sourceRow, rawCount: rawRows.length });
+      }
+      const targetKey = targetRow.correlation_key;
+      this.db.prepare('UPDATE cases SET team_override = ? WHERE id = ?')
+        .run(target.team === null || target.team === undefined ? '' : String(target.team), targetCaseId);
+
+      const insertMerge = this.db.prepare(`
+        INSERT INTO case_merges (
+          target_case_id, source_case_id, source_key, target_key, raw_count,
+          user_id, user_name, created_at, details_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      const mergeRows = [];
+      let movedRawIncidents = 0;
+      let movedHistory = 0;
+      let movedNotifications = 0;
+      for (const source of sources) {
+        const sourceCaseId = source.sourceCaseId;
+        const sourceKey = source.sourceRow.correlation_key;
+        const rawResult = this.db.prepare(
+          'UPDATE raw_incidents SET case_id = ?, updated_at = ? WHERE case_id = ?'
+        ).run(targetCaseId, now, sourceCaseId);
+        const historyResult = this.db.prepare(
+          'UPDATE history SET case_id = ? WHERE case_id = ?'
+        ).run(targetCaseId, sourceCaseId);
+        const notificationResult = this.db.prepare(
+          'UPDATE notifications SET case_id = ? WHERE case_id = ?'
+        ).run(targetCaseId, sourceCaseId);
+        this.db.prepare('UPDATE case_key_aliases SET case_id = ? WHERE case_id = ?')
+          .run(targetCaseId, sourceCaseId);
+        this.db.prepare(`
+          INSERT INTO case_key_aliases (correlation_key, case_id, created_at)
+          VALUES (?, ?, ?)
+          ON CONFLICT(correlation_key) DO UPDATE
+            SET case_id = excluded.case_id, created_at = excluded.created_at
+        `).run(sourceKey, targetCaseId, now);
+
+        const moved = {
+          movedRawIncidents: Number(rawResult.changes),
+          movedHistory: Number(historyResult.changes),
+          movedNotifications: Number(notificationResult.changes)
+        };
+        movedRawIncidents += moved.movedRawIncidents;
+        movedHistory += moved.movedHistory;
+        movedNotifications += moved.movedNotifications;
+        const sourceDetails = {
+          targetCaseId,
+          sourceCaseId,
+          sourceKey,
+          targetKey,
+          ...moved
+        };
+        const mergeResult = insertMerge.run(
+          targetCaseId,
+          sourceCaseId,
+          sourceKey,
+          targetKey,
+          moved.movedRawIncidents,
+          actor.id,
+          actor.name,
+          now,
+          JSON.stringify(sourceDetails)
+        );
+        mergeRows.push({
+          id: Number(mergeResult.lastInsertRowid),
+          sourceCaseId,
+          sourceKey,
+          rawCount: moved.movedRawIncidents,
+          ...moved
+        });
+      }
+
+      this.rebuildCases(now);
+      for (const source of sources) {
+        this.db.prepare('DELETE FROM cases WHERE id = ?').run(source.sourceCaseId);
+      }
+      const sourceKeys = sources.map(source => source.sourceRow.correlation_key);
+      const details = {
+        targetCaseId,
+        sourceCaseId: sourceCaseIds[0],
+        sourceCaseIds,
+        sourceKey: sourceKeys[0],
+        sourceKeys,
+        targetKey,
+        movedRawIncidents,
+        movedHistory,
+        movedNotifications,
+        merges: mergeRows
+      };
+      this.recordHistory({
+        caseId: targetCaseId,
+        user: actor,
+        action: 'merge',
+        details: { ...details, mergeIds: mergeRows.map(row => row.id) },
+        createdAt: now
+      });
+      const incident = this.getCase(targetCaseId);
+      if (!incident) throw new Error('Не удалось пересобрать целевой инцидент после объединения');
+      this.db.exec('COMMIT;');
+      return {
+        incident,
+        merge: { id: mergeRows[0].id, ...details }
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
+  setCorrelationKey(caseId, value, actor) {
+    const key = validateCorrelationKey(value);
+    const caseIdValue = String(caseId === null || caseId === undefined ? '' : caseId);
+    if (!caseIdValue) throw new ValidationError('caseId обязателен');
+    if (!actor || !actor.id || !actor.name) throw new ValidationError('actor обязателен');
+
+    const caseRow = this.db.prepare('SELECT * FROM cases WHERE id = ?').get(caseIdValue);
+    if (!caseRow) throw notFoundError('Инцидент не найден');
+    const canonical = JSON.parse(caseRow.canonical_json);
+    const lifecycle = caseLifecycle(canonical);
+    if (lifecycle === 'closed') throw conflictError('Нельзя задать correlationKey закрытому инциденту', 'case_closed');
+    if (lifecycle !== 'active' && lifecycle !== 'research') {
+      throw conflictError('correlationKey можно задать только открытому инциденту', 'case_not_open');
+    }
+
+    const raws = this.db.prepare(
+      'SELECT id, raw_json FROM raw_incidents WHERE case_id = ? ORDER BY id'
+    ).all(caseIdValue);
+    if (!raws.length) throw conflictError('Инцидент не содержит записей', 'empty_case');
+    for (const rawRow of raws) {
+      let rawJson;
+      try {
+        rawJson = JSON.parse(rawRow.raw_json);
+      } catch {
+        throw new ValidationError('Некорректные данные raw-инцидента');
+      }
+      const rawKey = nullableText(rawJson.correlationKey);
+      if (rawKey !== null && rawKey !== `id:${rawRow.id}`) {
+        throw conflictError(
+          'У инцидента уже есть явный correlationKey из ITSM; для объединения используйте слияние дел',
+          'not_keyless'
+        );
+      }
+    }
+
+    const collisionIds = [];
+    const seen = new Set();
+    const alias = this.db.prepare(
+      'SELECT case_id FROM case_key_aliases WHERE correlation_key = ?'
+    ).get(key);
+    if (alias && alias.case_id !== caseIdValue) {
+      collisionIds.push(alias.case_id);
+      seen.add(alias.case_id);
+    }
+    for (const row of this.db.prepare(`
+      SELECT id FROM cases WHERE correlation_key = ? AND id <> ? ORDER BY created_at, id
+    `).all(key, caseIdValue)) {
+      if (!seen.has(row.id)) {
+        seen.add(row.id);
+        collisionIds.push(row.id);
+      }
+    }
+
+    let collisionCaseId = null;
+    let closedCollision = false;
+    for (const candidateId of collisionIds) {
+      const candidate = this.db.prepare('SELECT id, canonical_json FROM cases WHERE id = ?').get(candidateId);
+      if (!candidate) continue;
+      const candidateLifecycle = caseLifecycle(JSON.parse(candidate.canonical_json));
+      if (candidateLifecycle === 'closed') {
+        closedCollision = true;
+        continue;
+      }
+      if (candidateLifecycle === 'active' || candidateLifecycle === 'research') {
+        collisionCaseId = candidateId;
+        break;
+      }
+    }
+
+    if (collisionCaseId) {
+      const result = this.mergeCases(collisionCaseId, caseIdValue, actor);
+      this.recordHistory({
+        caseId: collisionCaseId,
+        user: actor,
+        action: 'correlation_key',
+        details: {
+          correlationKey: key,
+          previousKey: caseRow.correlation_key,
+          mergedFromCaseId: caseIdValue
+        }
+      });
+      return result.incident;
+    }
+    if (closedCollision) {
+      throw conflictError('correlationKey уже занят закрытым инцидентом', 'correlation_key_conflict');
+    }
+
+    if (caseRow.correlation_key === key) {
+      return this.getCase(caseIdValue);
+    }
+
+    const now = Date.now();
+    this.db.exec('BEGIN IMMEDIATE;');
+    try {
+      this.db.prepare('UPDATE raw_incidents SET correlation_key = ? WHERE case_id = ?')
+        .run(key, caseIdValue);
+      const upsert = this.db.prepare(`
+        INSERT INTO correlation_overrides (raw_incident_id, correlation_key, user_id, user_name, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(raw_incident_id) DO UPDATE SET
+          correlation_key = excluded.correlation_key,
+          user_id = excluded.user_id,
+          user_name = excluded.user_name,
+          created_at = excluded.created_at
+      `);
+      for (const rawRow of raws) upsert.run(rawRow.id, key, actor.id, actor.name, now);
+      this.db.prepare('UPDATE cases SET correlation_key = ? WHERE id = ?').run(key, caseIdValue);
+      this.rebuildCases(now);
+      this.recordHistory({
+        caseId: caseIdValue,
+        user: actor,
+        action: 'correlation_key',
+        details: { correlationKey: key, previousKey: caseRow.correlation_key },
+        createdAt: now
+      });
+      const incident = this.getCase(caseIdValue);
+      if (!incident) throw new Error('Не удалось пересобрать инцидент после смены correlationKey');
+      this.db.exec('COMMIT;');
+      return incident;
+    } catch (error) {
+      this.db.exec('ROLLBACK;');
+      throw error;
+    }
+  }
+
   resetSyncState() {
     this.db.exec('BEGIN IMMEDIATE;');
     try {
+      this.db.exec('DELETE FROM case_merges;');
       this.db.exec('DELETE FROM raw_incidents;');
       this.db.exec('DELETE FROM cases;');
+      this.db.exec('DELETE FROM correlation_overrides;');
+      this.db.exec('DELETE FROM case_key_aliases;');
       this.setMetadata('itsmRevision', '0');
       this.setMetadata('syncError', null);
       this.db.exec('COMMIT;');
@@ -490,19 +952,23 @@ class Store {
             else stale += 1;
             continue;
           }
+          const updatedKey = this.effectiveCorrelationKey(raw);
           this.db.prepare(`
             UPDATE raw_incidents
             SET version = ?, correlation_key = ?, raw_json = ?, updated_at = ?
             WHERE id = ?
-          `).run(version, correlationKey(raw), serialized, syncedAt, id);
+          `).run(version, updatedKey, serialized, syncedAt, id);
           continue;
         }
 
-        const caseId = this.findOpenCase(correlationKey(raw)) || this.createCase(raw, syncedAt);
+        // A manual correlation-key override wins over the ITSM key for both
+        // case lookup and the stored raw key.
+        const key = this.effectiveCorrelationKey(raw);
+        const caseId = this.findOpenCase(key) || this.createCase(raw, syncedAt, key);
         this.db.prepare(`
           INSERT INTO raw_incidents (id, version, correlation_key, case_id, raw_json, created_at, updated_at)
           VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(id, version, correlationKey(raw), caseId, serialized, syncedAt, syncedAt);
+        `).run(id, version, key, caseId, serialized, syncedAt, syncedAt);
       }
 
       const after = this.rebuildCases(syncedAt);
@@ -534,6 +1000,10 @@ class Store {
 
   setPriorityOverride(caseId, priorityId) {
     this.db.prepare('UPDATE cases SET priority_override_id = ? WHERE id = ?').run(priorityId, caseId);
+  }
+
+  clearTeamOverride(caseId) {
+    this.db.prepare('UPDATE cases SET team_override = NULL WHERE id = ?').run(caseId);
   }
 
   recordHistory({ caseId, user, action, details, createdAt = Date.now() }) {

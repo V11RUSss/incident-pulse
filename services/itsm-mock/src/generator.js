@@ -92,6 +92,7 @@ const RECOVERY_BASE_STEP_BY_ID = Object.freeze({
   'MTS-SMS-0001': 5,
   'MTS-KION-0001': 6,
   'MTS-CLOUD-0001': 7,
+  'MTS-MOBILE-0003': 8,
 });
 
 function recreateInitialRecord(id, now) {
@@ -142,13 +143,13 @@ function generateInitialIncident(records, step, now) {
       }));
     case 2:
       return add(records, 'MTS-MOBILE-0002', now, {
-        correlationKey: 'mobile-voice-moscow-outage',
-        header: 'Обрывы голосовых вызовов в Московской области',
-        description: 'Дополнительный поток жалоб на ту же деградацию голосовой связи из Московской области.',
+        correlationKey: 'mobile-voice-moscow-regional',
+        header: 'Обрывы голосовых вызовов в Москве',
+        description: 'Абоненты сообщают об обрывах и невозможности установить голосовое соединение. Поток жалоб из Москвы продолжает расти, мониторинг фиксирует неуспешные вызовы.',
         productName: 'Mobile voice',
         service: 'Голосовая связь',
         scenarioName: 'Установление голосового соединения',
-        region: 'Московская область',
+        region: 'Москва',
         affectedUsers: 40,
         reportCount: 7,
         growth: 5,
@@ -222,9 +223,18 @@ function generateInitialIncident(records, step, now) {
         isEffect: true,
       });
     case 8:
-      return change(records, 'MTS-ID-0001', now, (existing) => ({
-        reportCount: existing.reportCount + 1,
-      }));
+      return add(records, 'MTS-MOBILE-0003', now, {
+        correlationKey: null,
+        header: 'Жалобы на обрывы голосовой связи в Москве',
+        description: 'Абоненты сообщают об обрывах и невозможности установить голосовое соединение. Обращения поступили из нескольких каналов, внешний источник не передал ключ корреляции.',
+        productName: 'Mobile voice',
+        service: 'Голосовая связь',
+        scenarioName: 'Установление голосового соединения',
+        region: 'Москва',
+        affectedUsers: 15,
+        reportCount: 3,
+        growth: 5,
+      });
     case 9:
       return change(records, 'MTS-BANK-0001', now, (existing) => ({
         stateId: 20,

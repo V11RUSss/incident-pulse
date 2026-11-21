@@ -73,6 +73,47 @@ test('continuation criticals alternate between new incidents and escalations', (
   assert.equal(escalated[0], CONTINUATION_START + CRITICAL_EVERY);
 });
 
+test('critical cadence constant stays at 12', () => {
+  assert.equal(CRITICAL_EVERY, 12);
+});
+
+test('demo data has semantic twins with different keys and one keyless sample', () => {
+  const records = new Map();
+  for (let step = 0; step < CONTINUATION_START; step += 1) {
+    const result = generateDemoIncident(records, step, NOW);
+    records.set(result.record.id, result.record);
+  }
+  assert.equal(records.size, 8, 'seven base records plus the keyless sample');
+
+  const base = records.get('MTS-MOBILE-0001');
+  const twin = records.get('MTS-MOBILE-0002');
+  assert.ok(base, 'base mobile incident is missing');
+  assert.ok(twin, 'semantic twin is missing');
+  assert.equal(base.correlationKey, 'mobile-voice-moscow-outage');
+  assert.equal(twin.correlationKey, 'mobile-voice-moscow-regional');
+  assert.notEqual(twin.correlationKey, base.correlationKey, 'twins must not share a correlation key');
+  assert.equal(twin.productName, base.productName);
+  assert.equal(twin.service, base.service);
+  assert.equal(twin.scenarioName, base.scenarioName);
+  assert.equal(twin.region, base.region);
+  assert.equal(twin.stateId, 0, 'twins stay open so triage can suggest a merge');
+
+  const keyless = [...records.values()].filter((record) => record.correlationKey === null);
+  assert.equal(keyless.length, 1, 'exactly one deterministic keyless sample');
+  assert.equal(keyless[0].id, 'MTS-MOBILE-0003');
+  assert.equal(keyless[0].productName, base.productName);
+  assert.equal(keyless[0].service, base.service);
+  assert.equal(keyless[0].scenarioName, base.scenarioName);
+  assert.equal(keyless[0].region, base.region);
+  assert.equal(keyless[0].stateId, 0);
+  assert.equal(keyless[0].isMaster, false);
+  assert.equal(keyless[0].isEffect, false);
+
+  for (const record of records.values()) {
+    assert.equal(record.assignedGroupName, null, `no auto-team for ${record.id}`);
+  }
+});
+
 async function createStore(t, state) {
   const dataDir = await mkdtemp(path.join(tmpdir(), 'itsm-mock-recovery-'));
   t.after(() => rm(dataDir, { recursive: true, force: true }));
@@ -117,7 +158,6 @@ test('recovery recreates a missing base record and still advances the demo', () 
 
 test('recovery recreates each missing later scenario record before applying its step', () => {
   const cases = [
-    { step: 8, id: 'MTS-ID-0001', stateId: 0, group: null },
     { step: 9, id: 'MTS-BANK-0001', stateId: 20, group: null },
     { step: 10, id: 'MTS-KION-0001', stateId: 7, group: null },
     { step: 11, id: 'MTS-SMS-0001', stateId: 0, group: null },
@@ -156,33 +196,33 @@ test('demo tick self-heals a persisted state whose base scenario record is missi
 });
 
 test('demo tick recreates a missing later scenario record without losing the rest of the state', async (t) => {
-  const played = replayScenario(8);
-  assert.equal(played.records.has('MTS-ID-0001'), true);
-  played.records.delete('MTS-ID-0001');
-  delete played.revisions['MTS-ID-0001'];
+  const played = replayScenario(9);
+  assert.equal(played.records.has('MTS-BANK-0001'), true);
+  played.records.delete('MTS-BANK-0001');
+  delete played.revisions['MTS-BANK-0001'];
 
   const store = await createStore(t, {
-    revision: 8,
+    revision: 9,
     incidents: [...played.records.values()],
     revisions: played.revisions,
-    demoStep: 8,
+    demoStep: 9,
   });
-  assert.equal(store.get('MTS-ID-0001'), undefined);
+  assert.equal(store.get('MTS-BANK-0001'), undefined);
   assert.equal(store.snapshot().incidents.length, played.records.size);
 
   const tick = await store.tick();
-  assert.equal(tick.revision, 9);
+  assert.equal(tick.revision, 10);
   assert.equal(tick.added, 1);
   assert.equal(tick.updated, 0);
-  assert.equal(tick.incidents[0].id, 'MTS-ID-0001');
-  assert.equal(tick.incidents[0].stateId, 0);
+  assert.equal(tick.incidents[0].id, 'MTS-BANK-0001');
+  assert.equal(tick.incidents[0].stateId, 20);
   assert.equal(tick.incidents[0].assignedGroupName, null);
   assert.equal(store.snapshot().incidents.length, played.records.size + 1);
 
   const next = await store.tick();
-  assert.equal(next.revision, 10);
-  assert.equal(next.incidents[0].id, 'MTS-BANK-0001');
-  assert.equal(next.incidents[0].stateId, 20);
+  assert.equal(next.revision, 11);
+  assert.equal(next.incidents[0].id, 'MTS-KION-0001');
+  assert.equal(next.incidents[0].stateId, 7);
 });
 
 test('reset followed by ticks replays the scenario from step 0', async (t) => {

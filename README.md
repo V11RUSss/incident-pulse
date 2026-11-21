@@ -192,19 +192,24 @@ App формирует canonical case по следующим правилам:
 Индикатор **Live** в верхней панели — переключатель:
 
 - Live ON — подписка SSE `GET /api/v1/events`; app получает `sync`/`incidents`
-  и обновляет доску без перезагрузки;
-- Live OFF — `EventSource` закрыт, новые события не принимаются;
-  ручная синхронизация продолжает работать;
+  и обновляет доску без перезагрузки. Пока есть SSE-подписчик, demo-генератор
+  сам создаёт события;
+- Live OFF — `EventSource` закрыт, сервер **останавливает авто-генерацию**
+  (нет SSE-клиентов); доска не получает новых событий. Кнопка
+  «Синхронизировать с ITSM» делает ровно один demo-тик и один sync; действия
+  координатора не создают новых инцидентов;
 - выбор хранится в `localStorage` (`incident-pulse-live`);
 - ошибка SSE показывает «Нет связи», но не сбрасывает выбор.
 
-В эмуляторе `DEMO_GENERATION=true`: app каждые 3–9 секунд запускает 1–3 шага mock-генератора (`DEMO_MIN_INTERVAL_MS`/`DEMO_MAX_INTERVAL_MS`, `DEMO_BATCH_MIN`/`DEMO_BATCH_MAX`), затем синхронизируется и рассылает SSE. Интервалы и размер пачки случайные, поэтому инциденты приходят неравномерно. Генератор **не назначает команды и не переводит кейсы в работу** — это делает только координатор. Критические инциденты создаются реже: не чаще одного continuation-шага из двенадцати; по умолчанию остаётся один стартовый критический пример.
+В эмуляторе `DEMO_GENERATION=true` при активном SSE (Live ON) app каждые 3–9 секунд запускает 1–3 шага mock-генератора (`DEMO_MIN_INTERVAL_MS`/`DEMO_MAX_INTERVAL_MS`, `DEMO_BATCH_MIN`/`DEMO_BATCH_MAX`), затем синхронизируется и рассылает SSE. Интервалы и размер пачки случайные, поэтому инциденты приходят неравномерно. Размер пачки ограничен оставшимися слотами `DEMO_MAX_ACTIVE` (по умолчанию 20), поэтому активных кейсов не может стать больше лимита. Живой клиент отключился — оставшиеся тики пачки не выполняются. Ручная синхронизация при Live OFF делает ровно один тик. Генератор **не назначает команды и не переводит кейсы в работу** — это делает только координатор. Критические инциденты создаются реже: не чаще одного continuation-шага из двенадцати; по умолчанию остаётся один стартовый критический пример.
 SSE раздаёт изменения браузеру. Это near-real-time, а не webhook от SimpleOne;
 для настоящего push нужен отдельный webhook, но для демо достаточно polling + SSE.
 
 ## Действия координатора и lifecycle
 
 В диалоге случая доступны назначение ответственного, смена координатора, ручной приоритет и возврат к auto, изменение deadline, выбор команды МТС, допустимые статусные переходы и история. Операции выполняются для всех `sourceIds` canonical case через атомарный bulk update mock.
+
+Назначение команды переводит кейс в «Выполняется», показывает команду на карточке и добавляет high/critical в блок «В работе», но оставляет его в приоритетной колонке. Срок SLA при этом **не продлевается автоматически** — он считается от момента возникновения; продление выполняется отдельным изменением deadline.
 
 | Действие | App API |
 | --- | --- |
@@ -282,12 +287,10 @@ API: `GET /api/v1/notifications`, `POST /api/v1/notifications/:id/read`,
 | Сменить роль | `PATCH /api/v1/admin/users/:id/role` с `{"role":"admin"}` | `{user:{id,name,login,role}}` |
 | Завершить сессии пользователя | `POST /api/v1/admin/users/:id/logout` | `{ok:true,removedSessions:N}` |
 | Состояние системы | `GET /api/v1/admin/system` | `{revision,lastSyncedAt,syncError,counts,users,sessions,uptimeMs,mockReachable}` |
-| Демо: следующий tick | `POST /api/v1/admin/demo/tick` | `{added,updated,revision,demo}` |
-| Демо: критический инцидент | `POST /api/v1/admin/demo/critical` | `{added,updated,revision,demo}` |
-| Демо: сброс mock | `POST /api/v1/admin/demo/reset` | `{ok:true,revision:0}` |
+| Демо: сброс базы | `POST /api/v1/admin/demo/reset` | `{ok:true,revision:0}`; очищает mock и локальные кейсы/историю, пользователи сохраняются |
 | Журнал действий | `GET /api/v1/admin/audit?limit=50` | `{audit:[{id,userId,userName,action,targetType,targetId,details,createdAt}]}` |
 
-Правила: нельзя удалить собственную учётную запись; нельзя удалить или понизить последнего администратора (самопонижение разрешено, только если есть другой `admin`); несуществующий пользователь даёт `404`; неверная роль — `400`. Административные действия (`user.delete`, `user.role`, `user.logout`, `demo.tick`, `demo.critical`, `demo.reset`, а также ручная синхронизация `sync.manual`) пишутся в таблицу `audit`. `GET /api/v1/admin/system` проверяет mock с коротким таймаутом и не падает, если mock недоступен (`mockReachable:false`). Демо-эндпоинты синхронизируют состояние и при недоступном mock возвращают `502` с понятной ошибкой.
+Правила: нельзя удалить собственную учётную запись; нельзя удалить или понизить последнего администратора (самопонижение разрешено, только если есть другой `admin`); несуществующий пользователь даёт `404`; неверная роль — `400`. Административные действия (`user.delete`, `user.role`, `user.logout`, `demo.reset`, а также ручная синхронизация `sync.manual`) пишутся в таблицу `audit`. `GET /api/v1/admin/system` проверяет mock с коротким таймаутом и не падает, если mock недоступен (`mockReachable:false`). Демо-эндпоинты синхронизируют состояние и при недоступном mock возвращают `502` с понятной ошибкой.
 
 ## Прямой доступ к mock API
 
@@ -329,7 +332,7 @@ curl --fail-with-body --silent --show-error \
 
 `demo/critical` создаёт одну новую запись `MTS-CRIT-####` с `affectedUsers` 1200–3000, дедлайном через 10–15 минут, `stateId=0`, `isNeedUp=true`, уникальным `correlationKey`, версией 1 и увеличивает ревизию. `demo/reset` возвращает `{revision:0,incidents:[]}` и атомарно сохраняет пустое состояние.
 
-Начиная с 13-го демонстрационного шага (после 12 стартовых сценариев) каждый третий tick гарантированно содержит критическое событие: чередуются создание нового критического инцидента (`affectedUsers` ≥ 1200, короткий дедлайн, `isNeedUp`) и эскалация существующего активного случая до `affectedUsers` ≥ 1000 с пояснением в описании. Остальные tick-и продолжают обычный сценарий; id новых критических записей детерминированно зависят от `demoStep` (`MTS-CRIT-####`), поэтому дубликатов нет.
+Начиная с 13-го демонстрационного шага (после 12 стартовых сценариев) каждый двенадцатый continuation-шаг содержит критическое событие: чередуются создание нового критического инцидента (`affectedUsers` ≥ 1200, короткий дедлайн, `isNeedUp`) и эскалация существующего активного случая до `affectedUsers` ≥ 1000 с пояснением в описании. Остальные tick-и продолжают обычный сценарий; id новых критических записей детерминированно зависят от `demoStep` (`MTS-CRIT-####`), поэтому дубликатов нет.
 
 Для примеров PATCH и bulk update скопируйте `id` из ответа mock:
 
@@ -410,12 +413,13 @@ api:
 | `POSTMORTEM_ENABLED` | `true` |
 | `POSTMORTEM_RATE_LIMIT_PER_MIN` | `10` |
 | `POSTMORTEM_TIMEOUT_MS` | `60000` |
-| `QUALITY_ENABLED` | `true` |
-| `QUALITY_AI_ENABLED` | `true` |
-| `QUALITY_AI_RATE_LIMIT_PER_MIN` | `5` |
-| `QUALITY_AI_TIMEOUT_MS` | `20000` |
+| `TRIAGE_ENABLED` | `true` |
+| `TRIAGE_AI_ENABLED` | `true` |
+| `TRIAGE_AI_RATE_LIMIT_PER_MIN` | `10` |
+| `TRIAGE_AI_TIMEOUT_MS` | `20000` |
 | `DEMO_MIN_INTERVAL_MS` | `3000` |
 | `DEMO_MAX_INTERVAL_MS` | `9000` |
+| `DEMO_MAX_ACTIVE` | `20` |
 | `DEMO_BATCH_MIN` | `1` |
 | `DEMO_BATCH_MAX` | `3` |
 | `PUBLIC_ORIGIN` | пусто |
@@ -675,29 +679,50 @@ Content-Type: application/json
 `POSTMORTEM_RATE_LIMIT_PER_MIN`; таймаут `POSTMORTEM_TIMEOUT_MS`;
 флаг `POSTMORTEM_ENABLED=false` скрывает кнопку и endpoint.
 
-### Линтер качества и AI semantic scan
+### Дубли: семантическая склейка
 
-`GET /api/v1/quality` быстро считает детерминированный отчёт по canonical cases:
+Похожие кейсы живут в отдельном контуре **«Дубли»**. Это упрощённый semantic
+triage: AI помогает найти группу, но решение всегда за координатором.
 
-- активный кейс без команды/координатора;
-- пустой/шаблонный `solution`, solution у активного кейса;
-- дубли по продукту/региону и похожему title;
-- конфликт description со статусом;
-- пропущенные поля и просроченный SLA без эскалации.
+- GET /api/v1/triage — deterministic-кандидаты: open-кейсы одного lifecycle
+  (active+active или research+research), похожие по product/region/title/
+  description. API отдаёт пары; UI собирает их в **один кластер** через
+  union-find, поэтому 3 похожих кейса — одна карточка, а не 3 пары.
+- При первом открытии панели «Дубли» правила показываются сразу, затем
+  автоматически выполняется POST /api/v1/triage/scan. Отдельной кнопки
+  «Проверить смысл» нет; AI не открывает модалок и не меняет данные.
+  Результат кэшируется; при ошибке остаются правила (source:"rules").
+- POST /api/v1/cases/:targetCaseId/merge —
+  {sourceCaseIds:[...], expectedVersions:{caseId:version}} (single-source
+  legacy body тоже поддержан). Один target, все source объединяются одной
+  транзакцией: raw-записи, history и notifications переезжают в target,
+  source-кейсы удаляются, source correlationKey становится alias-ом target,
+  пишется audit case_merges и одна history merge.
+- correlationKey в UI отсутствует полностью: нет вкладки «Ключи», диалога,
+  подсказок и требования ключа для merge. Ключ остаётся только внутренним
+  механизмом canonical cases; merge работает по case ID.
 
-`score` считается сервером: `100 - 12*high - 6*medium - 2*low`;
-findings содержат message/evidence/relatedCaseId. В UI — чип «Качество N»,
-бейджи на карточках и drawer с кольцом score, фильтрами и переходом к кейсу.
+Правила: закрытые кейсы не склеиваются; active+research запрещено; разные
+команды разрешены с предупреждением, команда target сохраняется; target по
+умолчанию — более старый/крупный кейс, в окне подтверждения его можно выбрать.
+Автоматических склеек нет.
 
-Кнопка **«Проверить смысл»** вызывает `POST /api/v1/quality/scan`
-(опционально `{caseIds:[]}`, до 20). AI проверяет только выбранные кейсы
-по solution/description/status, возвращает strict JSON с evidence; сервер
-валидирует, дедуплицирует с правилами и пересчитывает score. AI недоступен →
-`source:"rules"`, `aiSkipped:true`, без 5xx. Это on-demand, не на каждом refresh;
-кэш по `caseId+version+solution/description`, rate limit POST.
+UI: чип **«Дубли N»**, одна карточка на группу, сворачиваемое «Почему?»,
+один select целевого кейса и одна кнопка «Объединить N кейсов». В диалоге
+инцидента основной столбец — **Настройки** и **Информация**; ИИ-сводка,
+история изменений и «Похожие» вынесены в правую колонку. Они не пропадают
+и не требуют раскрытия отдельного блока. Новой вкладки нет.
 
-Флаги: `QUALITY_ENABLED`, `QUALITY_AI_ENABLED`, `QUALITY_AI_RATE_LIMIT_PER_MIN`,
-`QUALITY_AI_TIMEOUT_MS`.
+Инцидент может быть общим: координатор не обязателен при появлении.
+В тулбаре есть фильтр «Без координатора», в настройках — «Взять в работу»
+(назначает текущего координатора и переводит в работу, если переход разрешён).
+
+Демо-данные: MTS-MOBILE-0001 и MTS-MOBILE-0002 имеют разные
+correlationKey, но семантически похожи; MTS-MOBILE-0003 — keyless-пример.
+Флаги: TRIAGE_ENABLED, TRIAGE_AI_ENABLED,
+TRIAGE_AI_RATE_LIMIT_PER_MIN, TRIAGE_AI_TIMEOUT_MS.
+Demo-генератор останавливает создание при DEMO_MAX_ACTIVE активных кейсах
+(по умолчанию 20), чтобы Live не заваливал доску.
 
 ## Тесты
 
@@ -708,7 +733,7 @@ cd services/app && npm test
 cd services/itsm-mock && npm test
 ```
 
-Покрыто: агрегация `affectedUsers`/`activeAffectedUsers` и автоприоритет, взаимоисключающие группы отображения, закрытые источники, ручной override, `STATUS_TRANSITIONS`, идемпотентность `applyDelta`, stale и пустой delta без роста версий, `resetSyncState`, миграция ролей и первый администратор, валидация mock PATCH, карантин `state.json`, эндпоинты `critical`/`reset`, каденция критических событий на 40 tick-ах, keyless-клиент vLLM, очистка Qwen thinking-блока, whitelist-валидация и исполнение фильтров, парсер ассистента и отказ от неизвестных полей, fallback-правила маршрутизации и валидация команды по `MTS_TEAMS`, нормализация истории и fallback постмортема, проверка fact/hypothesis-полей, deterministic quality rules/score, AI semantic merge/fallback, targeted notifications/SSE.
+Покрыто: агрегация `affectedUsers`/`activeAffectedUsers` и автоприоритет, взаимоисключающие группы отображения, закрытые источники, ручной override, `STATUS_TRANSITIONS`, идемпотентность `applyDelta`, stale и пустой delta без роста версий, `resetSyncState`, миграция ролей и первый администратор, валидация mock PATCH, карантин `state.json`, эндпоинты `critical`/`reset`, каденция критических событий на 40 tick-ах, keyless-клиент vLLM, очистка Qwen thinking-блока, whitelist-валидация и исполнение фильтров, парсер ассистента и отказ от неизвестных полей, fallback-правила маршрутизации и валидация команды по `MTS_TEAMS`, нормализация истории и fallback постмортема, проверка fact/hypothesis-полей, AI semantic merge/fallback, targeted notifications/SSE, cluster-based duplicate suggestions, one-shot AI scan, batch merge/aliases/target-team preservation, demo active cap.
 
 ## Постоянное хранение и сброс
 
@@ -748,7 +773,7 @@ rm -f "$COOKIE_JAR"
 
 | Сервис | Контейнер / хост | Основные настройки |
 | --- | --- | --- |
-| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true`, `AI_BASE_URL=https://api.deepseek.com`, `AI_MODEL=deepseek-chat`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `QUALITY_ENABLED=true`, `QUALITY_AI_ENABLED=true`, `QUALITY_AI_RATE_LIMIT_PER_MIN=5`, `QUALITY_AI_TIMEOUT_MS=20000`, `DEMO_MIN_INTERVAL_MS=3000`, `DEMO_MAX_INTERVAL_MS=9000`, `DEMO_BATCH_MIN=1`, `DEMO_BATCH_MAX=3`, `PUBLIC_ORIGIN=`, `SESSION_TTL_MS=604800000` |
+| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true`, `AI_BASE_URL=https://api.deepseek.com`, `AI_MODEL=deepseek-chat`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `TRIAGE_ENABLED=true`, `TRIAGE_AI_ENABLED=true`, `TRIAGE_AI_RATE_LIMIT_PER_MIN=10`, `TRIAGE_AI_TIMEOUT_MS=20000`, `DEMO_MIN_INTERVAL_MS=3000`, `DEMO_MAX_INTERVAL_MS=9000`, `DEMO_BATCH_MIN=1`, `DEMO_BATCH_MAX=3`, `DEMO_MAX_ACTIVE=20`, `PUBLIC_ORIGIN=`, `SESSION_TTL_MS=604800000` |
 | `itsm-mock` | `3001 / 8081` | `DATA_DIR=/data`, пустое начальное состояние на новом volume |
 
 `app` и `itsm-mock` собираются из корневого build context; локальный vLLM поднимается отдельными `docker-compose.vllm*.yml` только в `--mode=vllm`. `app` стартует после успешного healthcheck mock через `depends_on` с `service_healthy`; недоступный AI-бэкенд не блокирует запуск и уходит в AI-fallback.

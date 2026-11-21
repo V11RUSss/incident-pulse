@@ -9,8 +9,8 @@ const { AiClient, AiError } = require('./ai');
 const { askAssistant } = require('./assistant');
 const { suggestTeam } = require('./routing');
 const { generatePostmortem } = require('./postmortem');
-const { buildQualityReport, MAX_AI_CASE_IDS } = require('../lib/quality');
-const { scanQuality } = require('./quality');
+const { buildDeterministicReport } = require('../lib/triage');
+const { scanTriage } = require('./triage');
 const { filterIncidents } = require('../lib/filters');
 const { ItsmClient, ItsmError } = require('./itsm');
 const { Store } = require('./store');
@@ -31,6 +31,7 @@ const REPOSITORY_ROOT = path.resolve(__dirname, '../../..');
 const STATIC_DIR = path.resolve(process.env.STATIC_DIR || REPOSITORY_ROOT);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(REPOSITORY_ROOT, '.data'));
 const MAX_JSON_BYTES = 5 * 1024 * 1024;
+const MAX_MERGE_SOURCES = 100;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const MIME_TYPES = Object.freeze({
   '.css': 'text/css; charset=utf-8',
@@ -72,6 +73,7 @@ const demoBatchMax = Math.max(
   demoBatchMin,
   configuredInteger(process.env.DEMO_BATCH_MAX, 3, 1)
 );
+const demoMaxActive = configuredInteger(process.env.DEMO_MAX_ACTIVE, 20, 0);
 let demoNextAt = 0;
 const aiFallback = process.env.AI_FALLBACK !== 'false';
 const aiRateLimitPerMinute = configuredInteger(process.env.AI_RATE_LIMIT_PER_MIN, 10, 0);
@@ -83,10 +85,10 @@ const routingTimeoutMs = configuredInteger(process.env.ROUTING_TIMEOUT_MS, 20000
 const postmortemEnabled = process.env.POSTMORTEM_ENABLED !== 'false';
 const postmortemRateLimitPerMinute = configuredInteger(process.env.POSTMORTEM_RATE_LIMIT_PER_MIN, 10, 0);
 const postmortemTimeoutMs = configuredInteger(process.env.POSTMORTEM_TIMEOUT_MS, 60000, 1000);
-const qualityEnabled = process.env.QUALITY_ENABLED !== 'false';
-const qualityAiEnabled = process.env.QUALITY_AI_ENABLED !== 'false';
-const qualityRateLimitPerMinute = configuredInteger(process.env.QUALITY_AI_RATE_LIMIT_PER_MIN, 5, 0);
-const qualityTimeoutMs = configuredInteger(process.env.QUALITY_AI_TIMEOUT_MS, 20000, 1000);
+const triageEnabled = process.env.TRIAGE_ENABLED !== 'false';
+const triageAiEnabled = process.env.TRIAGE_AI_ENABLED !== 'false';
+const triageRateLimitPerMinute = configuredInteger(process.env.TRIAGE_AI_RATE_LIMIT_PER_MIN, 10, 0);
+const triageTimeoutMs = configuredInteger(process.env.TRIAGE_AI_TIMEOUT_MS, 20000, 1000);
 const publicOrigin = String(process.env.PUBLIC_ORIGIN || '').trim().replace(/\/+$/, '');
 const AI_RATE_WINDOW_MS = 60 * 1000;
 const ASSISTANT_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -106,7 +108,7 @@ const routingUsage = new Map();
 const routingCache = new Map();
 const postmortemUsage = new Map();
 const postmortemCache = new Map();
-const qualityUsage = new Map();
+const triageUsage = new Map();
 const loginFailures = new Map();
 const store = new Store(DATA_DIR);
 const auth = new Auth(store);
@@ -299,17 +301,17 @@ function enforcePostmortemRateLimit(user) {
   postmortemUsage.set(user.id, timestamps);
 }
 
-function enforceQualityRateLimit(user) {
-  if (qualityRateLimitPerMinute === 0) return;
+function enforceTriageRateLimit(user) {
+  if (triageRateLimitPerMinute === 0) return;
   const now = Date.now();
-  const timestamps = (qualityUsage.get(user.id) || [])
+  const timestamps = (triageUsage.get(user.id) || [])
     .filter(timestamp => timestamp > now - AI_RATE_WINDOW_MS);
-  if (timestamps.length >= qualityRateLimitPerMinute) {
-    qualityUsage.set(user.id, timestamps);
-    throw new HttpError('Слишком много запросов сканирования качества; повторите позже', 429, 'rate_limited');
+  if (timestamps.length >= triageRateLimitPerMinute) {
+    triageUsage.set(user.id, timestamps);
+    throw new HttpError('Слишком много запросов сканирования триажа; повторите позже', 429, 'rate_limited');
   }
   timestamps.push(now);
-  qualityUsage.set(user.id, timestamps);
+  triageUsage.set(user.id, timestamps);
 }
 
 function cachedAssistantResult(key) {
@@ -497,7 +499,7 @@ async function demoTickSafe() {
 async function synchronize(source, generate = false) {
   const previousSyncError = store.getSyncState().syncError;
   try {
-    const demo = generate ? await demoTickSafe() : null;
+    const demo = generate && store.countActiveCases() < demoMaxActive ? await demoTickSafe() : null;
     const { delta, reset } = await loadDelta();
     const changes = store.applyDelta(delta.incidents, delta.revision);
     if (reset) {
@@ -666,6 +668,8 @@ async function setTeam(caseId, user, body) {
       solution: null,
       completionDate: null
     });
+    // An explicit team action wins over the team preserved by a manual merge.
+    store.clearTeamOverride(caseId);
     await synchronize('team');
     store.recordHistory({ caseId, user, action: 'team', details: { team, stateId: 2 } });
     return { incident: requiredCase(caseId) };
@@ -894,42 +898,173 @@ async function postmortemGenerate(body) {
   return payload;
 }
 
-function qualityCaseIds(body) {
-  if (!Object.hasOwn(body, 'caseIds') || body.caseIds === undefined || body.caseIds === null) return null;
-  if (!Array.isArray(body.caseIds)) {
-    throw new HttpError('caseIds должен быть массивом caseId', 400, 'invalid_case_ids');
+function triageReport() {
+  return buildDeterministicReport(store.listCases());
+}
+
+async function triageScan() {
+  return scanTriage(ai, store.listCases(), {
+    aiEnabled: triageAiEnabled,
+    timeoutMs: triageTimeoutMs
+  });
+}
+
+function incidentLifecycle(incident) {
+  const groups = Array.isArray(incident.groups) ? incident.groups : [];
+  if (groups.includes('closed')) return 'closed';
+  if (groups.includes('active')) return 'active';
+  if (groups.includes('research')) return 'research';
+  return 'unknown';
+}
+
+function requiredLifecycleVersion(value, label) {
+  const version = integer(value);
+  if (version === null || version < 0) {
+    throw new HttpError(label + ' должен быть неотрицательным целым числом', 400);
   }
-  const unique = [];
+  return version;
+}
+
+function mergeSourceCaseIds(body, targetCaseId) {
+  const values = [];
+  if (body.sourceCaseIds !== undefined && body.sourceCaseIds !== null) {
+    if (!Array.isArray(body.sourceCaseIds)) {
+      throw new HttpError('sourceCaseIds должен быть массивом caseId', 400, 'invalid_merge');
+    }
+    values.push(...body.sourceCaseIds);
+  }
+  if (body.sourceCaseId !== undefined && body.sourceCaseId !== null) {
+    values.push(body.sourceCaseId);
+  }
+
+  const sourceCaseIds = [];
   const seen = new Set();
-  for (const value of body.caseIds) {
+  for (const value of values) {
     if (typeof value !== 'string' || !value.trim()) {
-      throw new HttpError('caseIds должен содержать непустые строки', 400, 'invalid_case_ids');
+      throw new HttpError('sourceCaseIds должен содержать непустые строки', 400, 'invalid_merge');
     }
-    const caseId = value.trim();
-    if (caseId.length > 200) {
-      throw new HttpError('caseId должен содержать не более 200 символов', 400, 'invalid_case_ids');
+    const sourceCaseId = value.trim();
+    if (sourceCaseId.length > 200) {
+      throw new HttpError('sourceCaseId слишком длинный', 400, 'invalid_merge');
     }
-    if (!seen.has(caseId)) {
-      seen.add(caseId);
-      unique.push(caseId);
+    if (sourceCaseId === targetCaseId) {
+      throw new HttpError('Нельзя объединить инцидент с самим собой', 400, 'invalid_merge');
+    }
+    if (!seen.has(sourceCaseId)) {
+      seen.add(sourceCaseId);
+      sourceCaseIds.push(sourceCaseId);
     }
   }
-  if (unique.length > MAX_AI_CASE_IDS) {
-    throw new HttpError('caseIds должен содержать не более ' + MAX_AI_CASE_IDS + ' значений', 400, 'invalid_case_ids');
+  if (!sourceCaseIds.length) {
+    throw new HttpError('sourceCaseIds обязателен', 400, 'invalid_merge');
   }
-  return unique;
+  if (sourceCaseIds.length > MAX_MERGE_SOURCES) {
+    throw new HttpError('sourceCaseIds должен содержать не более ' + MAX_MERGE_SOURCES + ' значений', 400, 'invalid_merge');
+  }
+  return sourceCaseIds;
 }
 
-function qualityReport() {
-  return buildQualityReport(store.listCases());
+function mergeExpectedVersions(body, targetCaseId, sourceCaseIds) {
+  let expectedVersions = {};
+  if (body.expectedVersions !== undefined && body.expectedVersions !== null) {
+    if (!isObject(body.expectedVersions)) {
+      throw new HttpError('expectedVersions должен быть объектом {caseId: version}', 400, 'invalid_merge');
+    }
+    expectedVersions = body.expectedVersions;
+  }
+  const batch = Array.isArray(body.sourceCaseIds);
+  const targetRaw = Object.hasOwn(body, 'expectedVersion') &&
+      body.expectedVersion !== null && body.expectedVersion !== undefined
+    ? body.expectedVersion
+    : Object.hasOwn(expectedVersions, targetCaseId)
+      ? expectedVersions[targetCaseId]
+      : null;
+  if (targetRaw === null || targetRaw === undefined) {
+    if (!batch) {
+      throw new HttpError('expectedVersion должен быть неотрицательным целым числом', 400, 'invalid_merge');
+    }
+  } else {
+    requiredLifecycleVersion(targetRaw, 'expectedVersion');
+  }
+
+  const sourceVersions = new Map();
+  for (const sourceCaseId of sourceCaseIds) {
+    let raw;
+    if (Object.hasOwn(expectedVersions, sourceCaseId)) {
+      raw = expectedVersions[sourceCaseId];
+    } else if (sourceCaseIds.length === 1 && Object.hasOwn(body, 'expectedSourceVersion')) {
+      raw = body.expectedSourceVersion;
+    }
+    if (raw === null || raw === undefined) {
+      throw new HttpError('expectedVersions["' + sourceCaseId + '"] обязателен', 400, 'invalid_merge');
+    }
+    sourceVersions.set(sourceCaseId, requiredLifecycleVersion(raw, 'expectedVersions["' + sourceCaseId + '"]'));
+  }
+  return {
+    targetExpected: targetRaw === null || targetRaw === undefined
+      ? null
+      : requiredLifecycleVersion(targetRaw, 'expectedVersion'),
+    sourceVersions
+  };
 }
 
-async function qualityScan(body) {
-  const caseIds = qualityCaseIds(body);
-  return scanQuality(ai, store.listCases(), {
-    caseIds: caseIds || undefined,
-    aiEnabled: qualityAiEnabled,
-    timeoutMs: qualityTimeoutMs
+async function mergeCasesRequest(targetCaseId, user, body) {
+  const sourceCaseIds = mergeSourceCaseIds(body, targetCaseId);
+  const { targetExpected, sourceVersions } = mergeExpectedVersions(body, targetCaseId, sourceCaseIds);
+
+  return enqueue(async () => {
+    const target = requiredCase(targetCaseId);
+    if (targetExpected !== null && target.version !== targetExpected) throw new ConflictError(target);
+    const sources = sourceCaseIds.map(sourceCaseId => requiredCase(sourceCaseId));
+    for (const source of sources) {
+      if (source.version !== sourceVersions.get(source.caseId)) throw new ConflictError(source);
+    }
+
+    const targetLifecycle = incidentLifecycle(target);
+    const lifecycles = [targetLifecycle, ...sources.map(incidentLifecycle)];
+    if (lifecycles.includes('closed')) {
+      throw new HttpError('Нельзя объединять закрытые инциденты', 409, 'case_closed');
+    }
+    if (lifecycles.includes('unknown')) {
+      throw new HttpError('Инцидент ещё не синхронизирован; повторите после синхронизации', 409, 'case_not_open');
+    }
+    if (lifecycles.some(lifecycle => lifecycle !== targetLifecycle)) {
+      throw new HttpError(
+        'Объединять можно только инциденты одного жизненного цикла (active+active или research+research)',
+        409,
+        'lifecycle_mismatch'
+      );
+    }
+    if (targetLifecycle !== 'active' && targetLifecycle !== 'research') {
+      throw new HttpError('Объединять можно только активные или research инциденты', 409, 'case_not_open');
+    }
+
+    const result = store.mergeCasesBatch(targetCaseId, sourceCaseIds, user);
+    broadcastIncidents({ added: 0, updated: sourceCaseIds.length, source: 'merge' });
+    return result;
+  });
+}
+
+async function setCorrelationKeyRequest(caseId, user, body) {
+  const correlationKey = nullableText(body.correlationKey);
+  if (!correlationKey) {
+    throw new HttpError('correlationKey обязателен', 400, 'invalid_correlation_key');
+  }
+  const expectedVersion = requiredLifecycleVersion(body.expectedVersion, 'expectedVersion');
+
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    if (current.version !== expectedVersion) throw new ConflictError(current);
+    const incident = store.setCorrelationKey(caseId, correlationKey, user);
+    const merged = incident.caseId !== caseId;
+    if (merged || incident.version !== current.version) {
+      broadcastIncidents({ added: 0, updated: 1, source: 'correlation-key' });
+    }
+    return {
+      incident,
+      merged,
+      ...(merged ? { sourceCaseId: caseId } : {})
+    };
   });
 }
 
@@ -1026,8 +1161,8 @@ function metaPayload() {
     assistantEnabled,
     routingEnabled,
     postmortemEnabled,
-    qualityEnabled,
-    qualityAiEnabled
+    triageEnabled,
+    triageAiEnabled
   };
 }
 
@@ -1192,28 +1327,6 @@ async function handleApi(req, res, pathname, search = '') {
     return;
   }
 
-  if (pathname === '/api/v1/admin/demo/tick' && req.method === 'POST') {
-    requireAdmin(session.user);
-    sendJson(res, 200, await enqueue(async () => {
-      const demo = await itsm.demoTick();
-      const changes = await synchronize('admin-tick');
-      adminAudit(session.user, 'demo.tick', 'demo', null, demo);
-      return { added: changes.added, updated: changes.updated, revision: changes.revision, demo };
-    }));
-    return;
-  }
-
-  if (pathname === '/api/v1/admin/demo/critical' && req.method === 'POST') {
-    requireAdmin(session.user);
-    sendJson(res, 200, await enqueue(async () => {
-      const demo = await itsm.demoCritical();
-      const changes = await synchronize('admin-critical');
-      adminAudit(session.user, 'demo.critical', 'demo', null, demo);
-      return { added: changes.added, updated: changes.updated, revision: changes.revision, demo };
-    }));
-    return;
-  }
-
   if (pathname === '/api/v1/admin/demo/reset' && req.method === 'POST') {
     requireAdmin(session.user);
     sendJson(res, 200, await enqueue(async () => {
@@ -1309,15 +1422,39 @@ async function handleApi(req, res, pathname, search = '') {
     sendJson(res, 200, await postmortemGenerate(await readObject(req)));
     return;
   }
-  if (req.method === 'GET' && pathname === '/api/v1/quality') {
-    if (!qualityEnabled) throw new HttpError('Контроль качества отключён', 404, 'quality_disabled');
-    sendJson(res, 200, qualityReport());
+  if (req.method === 'GET' && pathname === '/api/v1/triage') {
+    if (!triageEnabled) throw new HttpError('Триаж отключён', 404, 'triage_disabled');
+    sendJson(res, 200, triageReport());
     return;
   }
-  if (req.method === 'POST' && pathname === '/api/v1/quality/scan') {
-    if (!qualityEnabled) throw new HttpError('Контроль качества отключён', 404, 'quality_disabled');
-    enforceQualityRateLimit(session.user);
-    sendJson(res, 200, await qualityScan(await readOptionalObject(req)));
+  if (req.method === 'POST' && pathname === '/api/v1/triage/scan') {
+    if (!triageEnabled) throw new HttpError('Триаж отключён', 404, 'triage_disabled');
+    enforceTriageRateLimit(session.user);
+    await readOptionalObject(req);
+    sendJson(res, 200, await triageScan());
+    return;
+  }
+
+  const mergeCasesMatch = pathname.match(/^\/api\/v1\/cases\/([^/]+)\/merge$/);
+  if (mergeCasesMatch) {
+    if (req.method !== 'POST') throw new HttpError('Метод не поддерживается', 405);
+    if (!triageEnabled) throw new HttpError('Триаж отключён', 404, 'triage_disabled');
+    sendJson(res, 200, await mergeCasesRequest(
+      decodeCaseId(mergeCasesMatch[1]),
+      session.user,
+      await readObject(req)
+    ));
+    return;
+  }
+  const correlationKeyMatch = pathname.match(/^\/api\/v1\/cases\/([^/]+)\/correlation-key$/);
+  if (correlationKeyMatch) {
+    if (req.method !== 'POST') throw new HttpError('Метод не поддерживается', 405);
+    if (!triageEnabled) throw new HttpError('Триаж отключён', 404, 'triage_disabled');
+    sendJson(res, 200, await setCorrelationKeyRequest(
+      decodeCaseId(correlationKeyMatch[1]),
+      session.user,
+      await readObject(req)
+    ));
     return;
   }
 
@@ -1536,12 +1673,29 @@ async function main() {
   pollTimer = setInterval(() => {
     if (shuttingDown || pendingOperations > 0) return;
     const now = Date.now();
-    if (demoGeneration && now >= demoNextAt) {
+    // Demo generation is a Live-only feature: without active SSE subscribers
+    // the poll loop still synchronizes, but must not create incidents.
+    if (demoGeneration && eventClients.size > 0 && now >= demoNextAt) {
       const delay = demoMinIntervalMs + Math.floor(Math.random() * (demoMaxIntervalMs - demoMinIntervalMs + 1));
-      const batch = demoBatchMin + Math.floor(Math.random() * (demoBatchMax - demoBatchMin + 1));
+      const activeCases = store.countActiveCases();
+      const availableSlots = demoMaxActive - activeCases;
+      // Clamp the whole batch to the remaining cap. A demo tick changes at
+      // most one source record, so this cannot overshoot active-case cap.
+      const batch = Math.min(
+        demoBatchMin + Math.floor(Math.random() * (demoBatchMax - demoBatchMin + 1)),
+        Math.max(0, availableSlots)
+      );
       demoNextAt = now + delay;
+      // Do not grow the demo stream past the active-case cap; keep syncing so
+      // external ITSM changes and closures are still picked up.
+      if (batch <= 0) {
+        enqueue(() => synchronize('poll')).catch(() => {});
+        return;
+      }
       enqueue(async () => {
         for (let index = 0; index < batch; index += 1) {
+          // The last Live client may disconnect while this batch is queued.
+          if (eventClients.size === 0) break;
           const demo = await demoTickSafe();
           if (!demo) break;
         }

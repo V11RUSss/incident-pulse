@@ -14,8 +14,8 @@ const FALLBACK_META = Object.freeze({
   assistantEnabled: true,
   routingEnabled: true,
   postmortemEnabled: true,
-  qualityEnabled: true,
-  qualityAiEnabled: true,
+  triageEnabled: true,
+  triageAiEnabled: true,
   teams: [
     'КЦ ИТ Координаторы Массовых Инцидентов',
     'МТС ИТ Поддержка Mobile voice',
@@ -68,7 +68,7 @@ const state = {
   user: null,
   coordinators: [],
   meta: null,
-  filters: { search: '', product: 'all', riskOnly: false, archive: false },
+  filters: { search: '', product: 'all', riskOnly: false, unassigned: false, archive: false },
   productsKey: null,
   activeId: null,
   lastOpenedCaseId: null,
@@ -94,17 +94,19 @@ const state = {
     observer: null,
     inView: true
   },
-  quality: {
+  triage: {
     report: null,
-    counts: new Map(),
+    clusters: [],
     loading: false,
     scanning: false,
+    autoScanned: false,
     error: null,
     aiError: null,
     open: false,
-    filterType: 'all',
     focusCaseId: null,
-    preserveAi: false
+    preserveAi: false,
+    reportSignature: null,
+    merge: null
   },
   admin: { users: [], audit: [], system: null, tab: 'users', confirmTimer: null },
   assistant: {
@@ -143,6 +145,7 @@ const elements = {
   search: document.querySelector('#search'),
   product: document.querySelector('#product-filter'),
   risk: document.querySelector('#risk-filter'),
+  coordinator: document.querySelector('#coordinator-filter'),
   reset: document.querySelector('#reset-filters'),
   syncButton: document.querySelector('#sync-button'),
   archiveButton: document.querySelector('#archive-button'),
@@ -197,32 +200,39 @@ const elements = {
   notificationList: document.querySelector('#notification-list'),
   notificationEmpty: document.querySelector('#notification-empty'),
   notificationReadAll: document.querySelector('#notification-read-all'),
-  qualityChip: document.querySelector('#quality-chip'),
-  qualityPanel: document.querySelector('#quality-panel'),
-  qualityTitle: document.querySelector('#quality-title'),
-  qualityClose: document.querySelector('#quality-close'),
-  qualityRingWrap: document.querySelector('#quality-ring-wrap'),
-  qualityRing: document.querySelector('#quality-ring-value'),
-  qualityScore: document.querySelector('#quality-score'),
-  qualityStatus: document.querySelector('#quality-status'),
-  qualityVerdict: document.querySelector('#quality-verdict'),
-  qualityMeta: document.querySelector('#quality-meta'),
-  qualityCountHigh: document.querySelector('#quality-count-high'),
-  qualityCountMedium: document.querySelector('#quality-count-medium'),
-  qualityCountLow: document.querySelector('#quality-count-low'),
-  qualitySource: document.querySelector('#quality-source'),
-  qualityAiButton: document.querySelector('#quality-ai-button'),
-  qualityAiLabel: document.querySelector('#quality-ai-label'),
-  qualityAiStatus: document.querySelector('#quality-ai-status'),
-  qualityGenerated: document.querySelector('#quality-generated'),
-  qualityTruncated: document.querySelector('#quality-truncated'),
-  qualityFocus: document.querySelector('#quality-focus'),
-  qualityFocusCase: document.querySelector('#quality-focus-case'),
-  qualityFocusClear: document.querySelector('#quality-focus-clear'),
-  qualityFilters: document.querySelector('#quality-filters'),
-  qualityFindings: document.querySelector('#quality-findings'),
-  qualityEmpty: document.querySelector('#quality-empty'),
-  qualityError: document.querySelector('#quality-error'),
+  triageChip: document.querySelector('#triage-chip'),
+  triagePanel: document.querySelector('#triage-panel'),
+  triageTitle: document.querySelector('#triage-title'),
+  triageClose: document.querySelector('#triage-close'),
+  triageSummary: document.querySelector('#triage-summary'),
+  triageScanned: document.querySelector('#triage-scanned'),
+  triageSource: document.querySelector('#triage-source'),
+  triageAiStatus: document.querySelector('#triage-ai-status'),
+  triageGenerated: document.querySelector('#triage-generated'),
+  triageTruncated: document.querySelector('#triage-truncated'),
+  triageFocus: document.querySelector('#triage-focus'),
+  triageFocusCase: document.querySelector('#triage-focus-case'),
+  triageFocusClear: document.querySelector('#triage-focus-clear'),
+  triageList: document.querySelector('#triage-list'),
+  triageEmpty: document.querySelector('#triage-empty'),
+  triageError: document.querySelector('#triage-error'),
+  triageCasePanel: document.querySelector('#triage-case-panel'),
+  triageCaseSummary: document.querySelector('#triage-case-summary'),
+  triageCaseSource: document.querySelector('#triage-case-source'),
+  triageCaseList: document.querySelector('#triage-case-list'),
+  triageCaseEmpty: document.querySelector('#triage-case-empty'),
+  triageCaseOpen: document.querySelector('#triage-case-open'),
+  mergeDialog: document.querySelector('#merge-dialog'),
+  mergeTitle: document.querySelector('#merge-title'),
+  mergeSubtitle: document.querySelector('#merge-subtitle'),
+  mergeOptions: document.querySelector('#merge-options'),
+  mergeWarning: document.querySelector('#merge-warning'),
+  mergeNote: document.querySelector('#merge-note'),
+  mergeError: document.querySelector('#merge-error'),
+  mergeConfirm: document.querySelector('#merge-confirm'),
+  mergeCancel: document.querySelector('#merge-cancel'),
+  mergeClose: document.querySelector('#merge-close'),
+  takeWorkButton: document.querySelector('#take-work-button'),
 };
 
 /* ----------------------------------------------------------------- utils */
@@ -373,12 +383,18 @@ function renderLive() {
     return;
   }
   pill.hidden = false;
+  const syncButton = document.querySelector('#sync-button');
+  if (syncButton) {
+    syncButton.title = state.liveEnabled
+      ? 'Синхронизировать с ITSM'
+      : 'Live выкл: синхронизация добавит одно событие';
+  }
   pill.classList.remove('is-live', 'is-stale', 'is-connecting', 'is-off');
   pill.setAttribute('aria-pressed', String(state.liveEnabled));
   if (!state.liveEnabled) {
     pill.classList.add('is-off');
     text.textContent = 'live выкл';
-    pill.title = 'Автообновление выключено. Нажмите, чтобы включить.';
+    pill.title = 'Автообновление выключено. Новые события — только по кнопке «Синхронизировать с ITSM».';
     pill.setAttribute('aria-label', 'Включить автообновление инцидентов');
   } else if (state.live) {
     pill.classList.add('is-live');
@@ -513,7 +529,7 @@ function showView(name) {
   document.querySelector('#dashboard-view').hidden = name !== 'dashboard';
   renderLive();
   renderNotifications();
-  renderQualityChip();
+  renderTriageChip();
   syncAssistantVisibility();
   syncRoutingVisibility();
 }
@@ -549,7 +565,7 @@ function handleUnauthorized() {
   resetAssistantUi();
   resetRoutingUi();
   resetPostmortem({ abort: true, clearHistory: true, clearCache: true });
-  resetQuality();
+  resetTriage();
   setUser(null);
   state.incidents = [];
   state.counts = null;
@@ -572,8 +588,8 @@ async function loadMeta() {
         assistantEnabled: data.assistantEnabled !== false,
         routingEnabled: data.routingEnabled !== false,
         postmortemEnabled: data.postmortemEnabled !== false,
-        qualityEnabled: data.qualityEnabled !== false,
-        qualityAiEnabled: data.qualityAiEnabled !== false,
+        triageEnabled: data.triageEnabled !== false,
+        triageAiEnabled: data.triageAiEnabled !== false,
       };
     } else {
       state.meta = FALLBACK_META;
@@ -584,7 +600,7 @@ async function loadMeta() {
   syncAssistantVisibility();
   syncRoutingVisibility();
   updatePostmortemButton();
-  renderQualityChip();
+  renderTriageChip();
 }
 
 async function loadCoordinators() {
@@ -597,16 +613,28 @@ async function loadCoordinators() {
   }
 }
 
+function incidentCaseSignature() {
+  return state.incidents.map(incident => String(incident.caseId)).sort().join('|');
+}
+
+function invalidateAiReportsForIncidentSet() {
+  const signature = incidentCaseSignature();
+  if (state.triage.report && state.triage.reportSignature !== signature) {
+    state.triage.preserveAi = false;
+  }
+}
+
 async function refreshIncidents({ notify = false } = {}) {
   const data = await api('/api/v1/incidents');
   const previous = state.incidents;
   state.incidents = Array.isArray(data.incidents) ? data.incidents : [];
   state.counts = data.counts || null;
   state.lastSyncedAt = data.lastSyncedAt ?? null;
+  invalidateAiReportsForIncidentSet();
   state.syncError = data.syncError ?? null;
   render();
   if (notify) detectChanges(previous, state.incidents);
-  queueQualityRefresh();
+  queueTriageRefresh();
   return data;
 }
 
@@ -811,7 +839,7 @@ function renderNotifications() {
 
 function openNotificationPanel() {
   if (!elements.notificationPanel || !elements.notificationBell || elements.notificationBell.hidden) return;
-  if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+  if (state.triage.open) closeTriagePanel({ restoreFocus: false });
   state.notifications.open = true;
   elements.notificationPanel.hidden = false;
   elements.notificationBell.setAttribute('aria-expanded', 'true');
@@ -934,579 +962,819 @@ function onNotificationClick(event) {
   }
 }
 
-/* --------------------------------------------------------------- quality */
 
-const QUALITY_TONE_LABELS = Object.freeze({ ok: 'В норме', warning: 'Требует внимания', critical: 'Критично' });
-const QUALITY_SEVERITY_LABELS = Object.freeze({ high: 'Высокий', medium: 'Средний', low: 'Низкий' });
-const QUALITY_TYPE_LABELS = Object.freeze({
-  team: 'Нет команды',
-  solution: 'Решение',
-  duplicate: 'Дубликат',
-  status: 'Статус',
-  field: 'Поля',
-  sla: 'SLA'
-});
-const QUALITY_RING_RADIUS = 34;
-const QUALITY_RING_LENGTH = 2 * Math.PI * QUALITY_RING_RADIUS;
-let qualityRequest = null;
+/* --------------------------------------------------------------- triage */
 
-function qualityEnabled() {
-  return meta().qualityEnabled !== false;
+const TRIAGE_CONFIDENCE_LABELS = Object.freeze({ high: 'Высокая', medium: 'Средняя', low: 'Низкая' });
+const TRIAGE_CONFIDENCE_RANK = Object.freeze({ high: 3, medium: 2, low: 1 });
+let triageRequest = null;
+
+function triageEnabled() {
+  return meta().triageEnabled !== false;
 }
 
-function qualityAiEnabled() {
-  return qualityEnabled() && meta().qualityAiEnabled !== false;
+function triageAiEnabled() {
+  return triageEnabled() && meta().triageAiEnabled !== false;
 }
 
-function qualityNum(value) {
+function triageModalOpen() {
+  return Boolean(elements.mergeDialog && elements.mergeDialog.open);
+}
+
+function triageNum(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
-function qualityScore(value) {
-  return Math.max(0, Math.min(100, Math.round(qualityNum(value))));
+function triageText(value) {
+  return value === null || value === undefined ? '' : String(value);
 }
 
-function qualitySeverity(value) {
-  const raw = String(value || '').toLowerCase();
-  if (['high', 'critical', 'crit', 'error', 'blocker'].includes(raw)) return 'high';
-  if (['medium', 'warning', 'warn', 'moderate', 'attention'].includes(raw)) return 'medium';
-  return 'low';
+function triageConfidence(value) {
+  const raw = String(value === null || value === undefined ? '' : value).toLowerCase();
+  if (raw === 'high' || raw === 'medium' || raw === 'low') return raw;
+  return '';
 }
 
-function qualitySeverityRank(severity) {
-  return severity === 'high' ? 3 : severity === 'medium' ? 2 : 1;
+function triageConfidenceLabel(value) {
+  return TRIAGE_CONFIDENCE_LABELS[value] || '';
 }
 
-function qualityTone(report) {
-  if (!report) return 'ok';
-  const status = String(report.status || '').toLowerCase();
-  if (status) {
-    if (/crit|bad|poor|fail|error/.test(status)) return 'critical';
-    if (/warn|attention|risk|medium/.test(status)) return 'warning';
-    if (/^(ok|good|fine|pass|normal|clean)$/.test(status)) return 'ok';
-  }
-  const score = qualityNum(report.score);
-  if (score >= 85) return 'ok';
-  if (score >= 60) return 'warning';
-  return 'critical';
+function triageConfidenceRank(value) {
+  return TRIAGE_CONFIDENCE_RANK[value] || 0;
 }
 
-function qualityStatusLabel(report) {
-  const status = String((report && report.status) || '').toLowerCase();
-  if (/^(ok|good|fine|pass|normal|clean)$/.test(status)) return 'В норме';
-  if (/warn|attention|risk/.test(status)) return 'Требует внимания';
-  if (/crit|bad|poor|fail|error/.test(status)) return 'Критично';
-  return QUALITY_TONE_LABELS[qualityTone(report)];
-}
-
-function qualityVerdict(report) {
-  const total = qualityNum(report.total);
-  if (!total) return 'Проблем не найдено: данные выглядят согласованно.';
-  const parts = [];
-  const high = qualityNum(report.high);
-  const medium = qualityNum(report.medium);
-  const low = qualityNum(report.low);
-  if (high) parts.push(high + ' ' + plural(high, 'высокая', 'высокие', 'высоких'));
-  if (medium) parts.push(medium + ' ' + plural(medium, 'средняя', 'средние', 'средних'));
-  if (low) parts.push(low + ' ' + plural(low, 'низкая', 'низкие', 'низких'));
-  const suffix = plural(total, 'проблема', 'проблемы', 'проблем');
-  const lead = total === 1 ? 'Найдена ' + total + ' ' + suffix : 'Найдено ' + total + ' ' + suffix;
-  return lead + (parts.length ? ': ' + parts.join(', ') : '') + '.';
-}
-
-function qualityTypeLabel(report, type) {
-  const labels = (report && report.typeLabels) || {};
-  if (type && typeof labels[type] === 'string' && labels[type]) return labels[type];
-  if (type && QUALITY_TYPE_LABELS[type]) return QUALITY_TYPE_LABELS[type];
-  return type || 'Проверка';
-}
-
-function qualityFindingMatches(finding, caseId) {
-  if (!finding || !caseId) return false;
+function triageIncidentFor(caseId) {
+  if (caseId === null || caseId === undefined) return null;
   const key = String(caseId);
-  return String(finding.caseId ?? '') === key || String(finding.incidentId ?? '') === key;
+  return state.incidents.find(incident => String(incident.caseId) === key) || null;
 }
 
-function qualityScopedFindings() {
-  const report = state.quality.report;
-  if (!report) return [];
-  const focus = state.quality.focusCaseId;
-  if (!focus) return report.findings;
-  return report.findings.filter(finding => qualityFindingMatches(finding, focus));
-}
-
-function qualityVisibleFindings() {
-  const scoped = qualityScopedFindings();
-  const type = state.quality.filterType;
-  const filtered = type === 'all' ? scoped : scoped.filter(finding => finding.type === type);
-  return [...filtered].sort((a, b) => qualitySeverityRank(qualitySeverity(b.severity)) - qualitySeverityRank(qualitySeverity(a.severity)));
-}
-
-function buildQualityCounts(findings) {
-  const map = new Map();
-  const bump = (key, severity) => {
-    if (key === undefined || key === null || key === '') return;
-    const entry = map.get(String(key)) || { count: 0, tone: 'low' };
-    entry.count += 1;
-    if (qualitySeverityRank(severity) > qualitySeverityRank(entry.tone)) entry.tone = severity;
-    map.set(String(key), entry);
+function triageCaseInfo(caseId, extra = {}) {
+  const incident = triageIncidentFor(caseId);
+  const key = String(caseId);
+  return {
+    caseId: key,
+    incidentId: incident ? incident.id : triageText(extra.incidentId),
+    title: incident ? incident.title : (triageText(extra.title) || 'Кейс ' + key),
+    product: incident ? incident.product : '',
+    team: incident ? (incident.team || '') : '',
+    startedAt: incident ? incident.startedAt : null,
+    affectedUsers: incident ? triageNum(incident.affectedUsers) : 0,
+    reportCount: incident ? triageNum(incident.reportCount) : 0,
+    version: incident && Number.isInteger(incident.version) ? incident.version : null
   };
-  for (const finding of findings) {
-    const severity = qualitySeverity(finding.severity);
-    bump(finding.caseId, severity);
-    bump(finding.incidentId, severity);
+}
+
+function triageMergeWeight(info) {
+  return triageNum(info.affectedUsers) + triageNum(info.reportCount) * 2;
+}
+
+function triagePickTarget(cases) {
+  if (!cases || !cases.length) return null;
+  const sorted = cases.slice().sort((a, b) => {
+    const weightDiff = triageMergeWeight(b) - triageMergeWeight(a);
+    if (weightDiff) return weightDiff;
+    const startA = notificationTimestamp(a.startedAt);
+    const startB = notificationTimestamp(b.startedAt);
+    if (startA !== null && startB !== null && startA !== startB) return startA - startB;
+    return String(a.caseId).localeCompare(String(b.caseId));
+  });
+  return sorted[0].caseId;
+}
+
+function normalizeTriageSuggestion(raw) {
+  if (!raw || typeof raw !== 'object' || raw.type !== 'merge') return null;
+  if (!raw.sourceCaseId || !raw.targetCaseId) return null;
+  if (String(raw.sourceCaseId) === String(raw.targetCaseId)) return null;
+  return {
+    id: triageText(raw.id) || ('merge:' + raw.targetCaseId + ':' + raw.sourceCaseId),
+    sourceCaseId: String(raw.sourceCaseId),
+    targetCaseId: String(raw.targetCaseId),
+    confidence: triageConfidence(raw.confidence),
+    rationale: triageText(raw.rationale),
+    evidence: triageText(raw.evidence),
+    sourceTitle: triageText(raw.sourceTitle),
+    targetTitle: triageText(raw.targetTitle),
+    sourceIncidentId: triageText(raw.sourceIncidentId),
+    targetIncidentId: triageText(raw.targetIncidentId),
+    similarity: raw.similarity === null || raw.similarity === undefined ? null : triageNum(raw.similarity)
+  };
+}
+
+function triageSuggestionCaseExtra(suggestion, caseId) {
+  if (String(caseId) === suggestion.sourceCaseId) return { incidentId: suggestion.sourceIncidentId, title: suggestion.sourceTitle };
+  if (String(caseId) === suggestion.targetCaseId) return { incidentId: suggestion.targetIncidentId, title: suggestion.targetTitle };
+  return {};
+}
+
+function buildTriageClusters(suggestions) {
+  const parent = new Map();
+  const find = key => {
+    let root = key;
+    while (parent.get(root) !== root) root = parent.get(root);
+    let current = key;
+    while (parent.get(current) !== current) {
+      const next = parent.get(current);
+      parent.set(current, root);
+      current = next;
+    }
+    return root;
+  };
+  const add = key => { if (!parent.has(key)) parent.set(key, key); };
+  const union = (a, b) => {
+    const rootA = find(a);
+    const rootB = find(b);
+    if (rootA !== rootB) parent.set(rootB, rootA);
+  };
+  for (const suggestion of suggestions) {
+    add(suggestion.sourceCaseId);
+    add(suggestion.targetCaseId);
+    union(suggestion.sourceCaseId, suggestion.targetCaseId);
   }
-  return map;
+  const groups = new Map();
+  for (const suggestion of suggestions) {
+    const root = find(suggestion.sourceCaseId);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(suggestion);
+  }
+  const clusters = [];
+  for (const edges of groups.values()) {
+    const caseIds = [...new Set(edges.flatMap(edge => [edge.sourceCaseId, edge.targetCaseId]))];
+    const cases = caseIds.map(caseId => {
+      const edge = edges.find(item => item.sourceCaseId === caseId || item.targetCaseId === caseId);
+      return triageCaseInfo(caseId, edge ? triageSuggestionCaseExtra(edge, caseId) : {});
+    });
+    const best = edges.slice().sort((a, b) => {
+      const rankDiff = triageConfidenceRank(b.confidence) - triageConfidenceRank(a.confidence);
+      if (rankDiff) return rankDiff;
+      return (b.similarity || 0) - (a.similarity || 0);
+    })[0];
+    const preferredTarget = caseIds.includes(best.targetCaseId) ? best.targetCaseId : triagePickTarget(cases);
+    const confidence = edges.reduce((max, edge) => Math.max(max, triageConfidenceRank(edge.confidence)), 0);
+    const confidenceLabel = confidence === 3 ? 'high' : confidence === 2 ? 'medium' : 'low';
+    clusters.push({
+      id: 'cluster:' + caseIds.slice().sort().join('|'),
+      caseIds,
+      cases,
+      suggestions: edges,
+      preferredTarget,
+      confidence: confidenceLabel
+    });
+  }
+  clusters.sort((a, b) => {
+    const rankDiff = triageConfidenceRank(b.confidence) - triageConfidenceRank(a.confidence);
+    if (rankDiff) return rankDiff;
+    return String(a.caseIds[0]).localeCompare(String(b.caseIds[0]), 'ru');
+  });
+  return clusters;
 }
 
-function qualityForIncident(incident) {
-  if (!qualityEnabled() || !state.quality.report) return null;
-  const counts = state.quality.counts;
-  const entry = counts.get(String(incident.caseId)) || counts.get(String(incident.id));
-  return entry && entry.count > 0 ? entry : null;
-}
-
-function qualityBadgeFor(incident) {
-  const entry = qualityForIncident(incident);
-  if (!entry) return '';
-  const label = 'Проблемы качества: ' + entry.count + '. Открыть панель качества.';
-  return '<button class="quality-badge quality-badge--' + entry.tone + '" type="button" data-quality-case="'
-    + escapeHtml(incident.caseId) + '" aria-label="' + escapeHtml(label) + '" title="' + escapeHtml(label) + '">'
-    + icon('shield') + entry.count + '</button>';
-}
-
-function applyQualityReport(raw) {
-  if (!qualityEnabled()) return;
-  if (!raw || typeof raw !== 'object') return;
-  const findings = (Array.isArray(raw.findings) ? raw.findings : []).filter(item => item && typeof item === 'object');
-  const countSeverity = severity => findings.filter(finding => qualitySeverity(finding.severity) === severity).length;
-  const bySeverity = raw.bySeverity && typeof raw.bySeverity === 'object' && !Array.isArray(raw.bySeverity) ? raw.bySeverity : {};
-  const severityCount = (direct, severity) => {
-    if (direct !== undefined && direct !== null) return qualityNum(direct);
-    if (bySeverity[severity] !== undefined && bySeverity[severity] !== null) return qualityNum(bySeverity[severity]);
-    return countSeverity(severity);
-  };
-  const high = severityCount(raw.high, 'high');
-  const medium = severityCount(raw.medium, 'medium');
-  const low = severityCount(raw.low, 'low');
-  const report = {
-    score: qualityScore(raw.score),
-    status: typeof raw.status === 'string' ? raw.status : '',
-    total: raw.total !== undefined && raw.total !== null ? qualityNum(raw.total) : Math.max(high + medium + low, findings.length),
-    high,
-    medium,
-    low,
-    byType: raw.byType && typeof raw.byType === 'object' && !Array.isArray(raw.byType) ? raw.byType : {},
-    typeLabels: raw.typeLabels && typeof raw.typeLabels === 'object' && !Array.isArray(raw.typeLabels) ? raw.typeLabels : {},
-    scannedCases: qualityNum(raw.scannedCases),
+function applyTriageReport(raw) {
+  if (!triageEnabled() || !raw || typeof raw !== 'object') return;
+  if (!state.incidents.length) {
+    state.triage.report = {
+      suggestions: [], clusters: [], scannedCases: 0, candidatePairs: 0, truncated: false,
+      source: 'rules', generatedAt: raw.generatedAt === undefined ? null : raw.generatedAt,
+      aiChecked: null, aiSkipped: null, counts: { groups: 0, cases: 0 }
+    };
+    state.triage.clusters = [];
+    state.triage.reportSignature = '';
+    state.triage.preserveAi = false;
+    state.triage.error = null;
+    state.triage.aiError = null;
+    return;
+  }
+  const suggestions = (Array.isArray(raw.suggestions) ? raw.suggestions : [])
+    .map(normalizeTriageSuggestion)
+    .filter(Boolean);
+  const clusters = buildTriageClusters(suggestions);
+  const caseIds = new Set(clusters.flatMap(cluster => cluster.caseIds));
+  state.triage.report = {
+    suggestions,
+    clusters,
+    scannedCases: triageNum(raw.scannedCases),
+    candidatePairs: triageNum(raw.candidatePairs),
     truncated: Boolean(raw.truncated),
-    findings,
     source: raw.source === 'rules+ai' ? 'rules+ai' : 'rules',
-    generatedAt: raw.generatedAt ?? null,
-    aiChecked: raw.aiChecked === undefined || raw.aiChecked === null ? null : qualityNum(raw.aiChecked),
-    aiSkipped: raw.aiSkipped === undefined || raw.aiSkipped === null ? null : raw.aiSkipped
+    generatedAt: raw.generatedAt === undefined ? null : raw.generatedAt,
+    aiChecked: raw.aiChecked === undefined ? null : raw.aiChecked,
+    aiSkipped: raw.aiSkipped === undefined ? null : raw.aiSkipped,
+    counts: {
+      groups: clusters.length,
+      cases: caseIds.size
+    }
   };
-  state.quality.report = report;
-  state.quality.preserveAi = report.source === 'rules+ai';
-  state.quality.counts = buildQualityCounts(findings);
-  state.quality.error = null;
-  state.quality.aiError = null;
-  const activeTypes = new Set(findings.map(finding => finding.type).filter(Boolean));
-  for (const type of Object.keys(report.byType)) {
-    if (qualityNum(report.byType[type]) > 0) activeTypes.add(type);
-  }
-  if (state.quality.filterType !== 'all' && !activeTypes.has(state.quality.filterType)) state.quality.filterType = 'all';
-  const focus = state.quality.focusCaseId;
-  if (focus && !findings.some(finding => qualityFindingMatches(finding, focus))) state.quality.focusCaseId = null;
+  state.triage.clusters = clusters;
+  state.triage.reportSignature = incidentCaseSignature();
+  state.triage.preserveAi = state.triage.report.source === 'rules+ai';
+  state.triage.error = null;
+  state.triage.aiError = null;
+  const focus = state.triage.focusCaseId;
+  if (focus && !clusters.some(cluster => triageClusterMatches(cluster, focus))) state.triage.focusCaseId = null;
 }
 
-function qualityTypeCounts() {
-  const counts = new Map();
-  for (const finding of qualityScopedFindings()) {
-    if (!finding.type) continue;
-    counts.set(finding.type, (counts.get(finding.type) || 0) + 1);
-  }
-  return counts;
+function triageClusterMatches(cluster, caseId) {
+  if (!cluster || caseId === null || caseId === undefined) return false;
+  return cluster.caseIds.includes(String(caseId));
 }
 
-function qualityTypes(report) {
-  if (!report) return [];
-  const labels = report.typeLabels || {};
-  const byType = report.byType || {};
-  const counts = qualityTypeCounts();
-  const seen = new Set();
-  const list = [];
-  const add = type => {
-    if (!type || seen.has(type)) return;
-    seen.add(type);
-    const known = counts.get(type);
-    const fallback = state.quality.focusCaseId ? 0 : qualityNum(byType[type]);
-    list.push({ type, label: qualityTypeLabel(report, type), count: known === undefined ? fallback : known });
-  };
-  for (const type of Object.keys(labels)) add(type);
-  for (const type of Object.keys(byType)) add(type);
-  for (const finding of report.findings) add(finding.type);
-  return list;
+function triageScopedClusters() {
+  const clusters = state.triage.clusters || [];
+  const focus = state.triage.focusCaseId;
+  if (!focus) return clusters;
+  return clusters.filter(cluster => triageClusterMatches(cluster, focus));
 }
 
-function qualityFocusCaseLabel(caseId) {
-  const report = state.quality.report;
-  const finding = report ? report.findings.find(item => qualityFindingMatches(item, caseId)) : null;
-  if (finding && finding.incidentId) return String(finding.incidentId);
-  const incident = findIncident(String(caseId));
+function triageFocusCaseLabel(caseId) {
+  const incident = triageIncidentFor(caseId);
   return incident ? incident.id : String(caseId);
 }
 
-function qualityEvidenceText(evidence) {
-  if (evidence === null || evidence === undefined) return '';
-  let text;
-  if (typeof evidence === 'string') text = evidence;
-  else {
-    try { text = JSON.stringify(evidence); } catch { text = String(evidence); }
-  }
-  text = String(text).trim();
-  if (text.length > 240) text = text.slice(0, 237) + '…';
-  return text;
+function triageSourceLabel(report) {
+  return report && report.source === 'rules+ai' ? 'Правила + ИИ' : 'Правила';
 }
 
-function renderQualityChip() {
-  const chip = elements.qualityChip;
+function renderTriageChip() {
+  const chip = elements.triageChip;
   if (!chip) return;
-  const report = qualityEnabled() ? state.quality.report : null;
-  const visible = Boolean(report);
+  const report = triageEnabled() ? state.triage.report : null;
+  const visible = Boolean(report && report.counts && report.counts.groups > 0);
   chip.hidden = !visible;
   if (!visible) {
-    if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+    if (state.triage.open) closeTriagePanel({ restoreFocus: false });
     return;
   }
-  const tone = qualityTone(report);
-  chip.classList.remove('quality-chip--ok', 'quality-chip--warning', 'quality-chip--critical');
-  chip.classList.add('quality-chip--' + tone);
-  const total = qualityNum(report.total);
-  const score = qualityNum(report.score);
-  setText('#quality-chip-count', score);
-  chip.title = 'Качество данных: ' + score + '/100 · проблем: ' + total + '. Открыть панель качества.';
+  const groups = report.counts.groups;
+  setText('#triage-chip-count', groups);
+  chip.classList.toggle('triage-chip--active', groups > 0);
+  chip.title = 'Дубли: ' + groups + ' ' + plural(groups, 'группа', 'группы', 'групп') + '. Открыть панель дублей.';
   chip.setAttribute('aria-label', chip.title);
-  chip.setAttribute('aria-expanded', String(state.quality.open));
+  chip.setAttribute('aria-expanded', String(state.triage.open));
 }
 
-function renderQualityFilters(report) {
-  const container = elements.qualityFilters;
-  if (!container) return;
-  container.replaceChildren();
-  if (!report) return;
-  const counts = qualityTypeCounts();
-  const makeButton = (value, label, count) => {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'quality-filter';
-    button.dataset.qualityType = value;
-    button.setAttribute('aria-pressed', String(state.quality.filterType === value));
-    button.textContent = label + (count ? ' · ' + count : '');
-    return button;
-  };
-  container.append(makeButton('all', 'Все', qualityScopedFindings().length));
-  for (const item of qualityTypes(report)) {
-    const count = counts.get(item.type) === undefined ? item.count : counts.get(item.type);
-    if (!count) continue;
-    container.append(makeButton(item.type, item.label, count));
+function triageLoadError(error) {
+  const code = error && error.payload ? error.payload.code : '';
+  if (code === 'triage_disabled') return 'Дубли отключены на сервере.';
+  if (error.status === 429) return 'Слишком часто — попробуйте через минуту.';
+  return error.message || 'Не удалось загрузить список дублей.';
+}
+
+function triageAiStatusText(report) {
+  if (state.triage.scanning) return 'ИИ уточняет группы дублей…';
+  if (state.triage.aiError) return 'Ошибка ИИ: ' + state.triage.aiError;
+  if (!report) return '';
+  if (report.aiSkipped === true) return 'ИИ-проверка недоступна: показан детерминированный список дублей.';
+  if (report.source !== 'rules+ai') return '';
+  const checked = report.aiChecked;
+  if (checked === null || checked === undefined) return 'ИИ-проверка выполнена.';
+  const count = triageNum(checked);
+  return 'ИИ проверил ' + count + ' ' + plural(count, 'кейс', 'кейса', 'кейсов') + '.';
+}
+
+function triageCaseButton(caseId, extra = {}) {
+  const info = triageCaseInfo(caseId, extra);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'triage-case';
+  button.dataset.triageOpen = info.caseId;
+  const strong = document.createElement('strong');
+  strong.textContent = info.incidentId || info.caseId;
+  button.append(strong);
+  const title = document.createElement('span');
+  title.textContent = info.title;
+  button.append(title);
+  if (info.team) {
+    const team = document.createElement('small');
+    team.textContent = info.team;
+    button.append(team);
   }
+  return button;
 }
 
-function qualityFindingNode(finding) {
-  const severity = qualitySeverity(finding.severity);
+function triageWhyDetails(cluster) {
+  const details = document.createElement('details');
+  details.className = 'triage-why';
+  const summary = document.createElement('summary');
+  summary.textContent = 'Почему?';
+  details.append(summary);
+  const list = document.createElement('ul');
+  list.className = 'triage-why-list';
+  const seen = new Set();
+  for (const suggestion of cluster.suggestions) {
+    const text = suggestion.rationale || suggestion.evidence;
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    const item = document.createElement('li');
+    item.textContent = text;
+    if (suggestion.evidence && suggestion.evidence !== text) {
+      const evidence = document.createElement('span');
+      evidence.textContent = suggestion.evidence;
+      item.append(evidence);
+    }
+    list.append(item);
+  }
+  details.append(list);
+  return details;
+}
+
+function triageClusterNode(cluster) {
   const item = document.createElement('li');
-  item.className = 'quality-finding quality-finding--' + severity;
+  item.className = 'triage-cluster';
+  item.dataset.clusterId = cluster.id;
   const head = document.createElement('div');
-  head.className = 'quality-finding-head';
-  const severityBadge = document.createElement('span');
-  severityBadge.className = 'quality-severity quality-severity--' + severity;
-  severityBadge.textContent = QUALITY_SEVERITY_LABELS[severity];
-  head.append(severityBadge);
-  const typeBadge = document.createElement('span');
-  typeBadge.className = 'quality-type';
-  typeBadge.textContent = qualityTypeLabel(state.quality.report, finding.type);
-  head.append(typeBadge);
-  const caseLabel = document.createElement('span');
-  caseLabel.className = 'quality-case';
-  caseLabel.textContent = String(finding.incidentId || finding.caseId || '');
-  head.append(caseLabel);
-  const openButton = document.createElement('button');
-  openButton.type = 'button';
-  openButton.className = 'quality-open';
-  openButton.textContent = 'Открыть';
-  openButton.dataset.qualityOpen = String(finding.caseId || finding.incidentId || '');
-  if (!finding.caseId && !finding.incidentId) openButton.disabled = true;
-  head.append(openButton);
+  head.className = 'triage-cluster-head';
+  const badge = document.createElement('span');
+  badge.className = 'triage-badge triage-badge--merge';
+  badge.textContent = 'Дубли';
+  head.append(badge);
+  if (cluster.confidence) {
+    const confidence = document.createElement('span');
+    confidence.className = 'triage-confidence triage-confidence--' + cluster.confidence;
+    confidence.textContent = triageConfidenceLabel(cluster.confidence);
+    head.append(confidence);
+  }
+  const count = document.createElement('span');
+  count.className = 'triage-cluster-count';
+  count.textContent = cluster.caseIds.length + ' ' + plural(cluster.caseIds.length, 'кейс', 'кейса', 'кейсов');
+  head.append(count);
   item.append(head);
-  if (finding.title) {
-    const title = document.createElement('p');
-    title.className = 'quality-finding-title';
-    title.textContent = finding.title;
-    item.append(title);
+  const cases = document.createElement('div');
+  cases.className = 'triage-cluster-cases';
+  for (const info of cluster.cases) cases.append(triageCaseButton(info.caseId, { incidentId: info.incidentId, title: info.title }));
+  item.append(cases);
+  const teams = [...new Set(cluster.cases.map(info => info.team).filter(Boolean))];
+  if (teams.length > 1) {
+    const crossTeam = document.createElement('p');
+    crossTeam.className = 'triage-cross-team';
+    crossTeam.textContent = 'Разные команды: ' + teams.join(', ');
+    item.append(crossTeam);
   }
-  if (finding.message) {
-    const message = document.createElement('p');
-    message.className = 'quality-finding-message';
-    message.textContent = finding.message;
-    item.append(message);
+  const targetRow = document.createElement('label');
+  targetRow.className = 'triage-target-row';
+  const targetLabel = document.createElement('span');
+  targetLabel.textContent = 'Целевой кейс';
+  const select = document.createElement('select');
+  select.className = 'triage-cluster-target';
+  for (const info of cluster.cases) {
+    const option = document.createElement('option');
+    option.value = info.caseId;
+    option.textContent = (info.incidentId || info.caseId) + ' · ' + info.title;
+    option.selected = String(info.caseId) === String(cluster.preferredTarget);
+    select.append(option);
   }
-  const evidence = qualityEvidenceText(finding.evidence);
-  if (evidence) {
-    const evidenceNode = document.createElement('p');
-    evidenceNode.className = 'quality-evidence';
-    evidenceNode.textContent = evidence;
-    item.append(evidenceNode);
-  }
-  if (finding.rule) {
-    const rule = document.createElement('span');
-    rule.className = 'quality-rule';
-    rule.textContent = 'Правило: ' + finding.rule;
-    item.append(rule);
-  }
-  if (finding.relatedCaseId || finding.relatedIncidentId) {
-    const related = document.createElement('button');
-    related.type = 'button';
-    related.className = 'quality-open quality-open--related';
-    related.textContent = 'Связанный ' + String(finding.relatedIncidentId || finding.relatedCaseId);
-    if (finding.relatedTitle) related.title = String(finding.relatedTitle);
-    related.dataset.qualityOpen = String(finding.relatedCaseId || finding.relatedIncidentId);
-    item.append(related);
-  }
+  targetRow.append(targetLabel, select);
+  item.append(targetRow);
+  item.append(triageWhyDetails(cluster));
+  const actions = document.createElement('div');
+  actions.className = 'triage-cluster-actions';
+  const merge = document.createElement('button');
+  merge.type = 'button';
+  merge.className = 'button button-primary button-sm';
+  merge.dataset.triageMerge = cluster.caseIds.join('|');
+  merge.textContent = 'Объединить ' + cluster.caseIds.length + ' ' + plural(cluster.caseIds.length, 'кейс', 'кейса', 'кейсов');
+  actions.append(merge);
+  item.append(actions);
   return item;
 }
 
-function renderQualityFindings(report) {
-  const list = elements.qualityFindings;
-  if (!list) return;
-  list.replaceChildren();
-  const empty = elements.qualityEmpty;
-  if (!report) {
-    if (empty) empty.hidden = true;
-    return;
-  }
-  const visible = qualityVisibleFindings();
-  for (const finding of visible) list.append(qualityFindingNode(finding));
-  if (empty) {
-    empty.hidden = visible.length > 0;
-    empty.textContent = qualityNum(report.total) === 0
-      ? 'Проблем качества не найдено.'
-      : 'По выбранным условиям проблем нет.';
-  }
-}
-
-function qualityAiStatusText(report) {
-  if (state.quality.scanning) return 'ИИ разбирает формулировки…';
-  if (state.quality.aiError) return 'Ошибка ИИ: ' + state.quality.aiError;
-  if (!report) return '';
-  const checked = report.aiChecked;
-  const skipped = report.aiSkipped;
-  if (skipped === true) return 'ИИ-проверка недоступна: показан только детерминированный отчёт.';
-  if (checked === 0) return 'ИИ не нашёл кейсов для смысловой проверки.';
-  if (report.source !== 'rules+ai') return '';
-  let text = checked === null
-    ? 'ИИ-проверка выполнена.'
-    : 'ИИ проверил ' + checked + ' ' + plural(checked, 'кейс', 'кейса', 'кейсов') + '.';
-  if (typeof skipped === 'number' && skipped > 0) text += ' Пропущено: ' + skipped + '.';
-  return text;
-}
-
-function renderQualityPanel() {
-  const panel = elements.qualityPanel;
+function renderTriagePanel() {
+  const panel = elements.triagePanel;
   if (!panel) return;
-  if (!qualityEnabled()) {
-    if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+  if (!triageEnabled()) {
+    if (state.triage.open) closeTriagePanel({ restoreFocus: false });
     return;
   }
   if (panel.hidden) return;
-  const report = state.quality.report;
-  if (elements.qualityAiButton) {
-    elements.qualityAiButton.hidden = !qualityAiEnabled();
-    elements.qualityAiButton.disabled = state.quality.scanning || state.quality.loading;
-    elements.qualityAiButton.setAttribute('aria-busy', String(state.quality.scanning));
+  const report = state.triage.report;
+  if (elements.triageSummary) {
+    if (!report) {
+      elements.triageSummary.textContent = state.triage.loading ? 'Загружаем дубли…' : 'Нет данных';
+    } else if (report.counts.groups) {
+      elements.triageSummary.textContent = report.counts.groups + ' ' + plural(report.counts.groups, 'группа', 'группы', 'групп') + ' · ' + report.counts.cases + ' ' + plural(report.counts.cases, 'кейс', 'кейса', 'кейсов');
+    } else {
+      elements.triageSummary.textContent = 'Групп дублей нет';
+    }
   }
-  if (elements.qualityAiLabel) elements.qualityAiLabel.textContent = state.quality.scanning ? 'Проверяем…' : 'Проверить смысл';
-  if (elements.qualityScore) elements.qualityScore.textContent = report ? String(qualityNum(report.score)) : '—';
-  if (elements.qualityRing) {
-    const score = report ? qualityNum(report.score) : 0;
-    elements.qualityRing.setAttribute('stroke-dasharray', String(QUALITY_RING_LENGTH));
-    elements.qualityRing.setAttribute('stroke-dashoffset', String(QUALITY_RING_LENGTH * (1 - score / 100)));
-  }
-  if (elements.qualityRingWrap) {
-    elements.qualityRingWrap.classList.remove('is-ok', 'is-warning', 'is-critical');
-    elements.qualityRingWrap.classList.add('is-' + qualityTone(report));
-  }
-  if (elements.qualityStatus) {
-    elements.qualityStatus.textContent = report
-      ? qualityStatusLabel(report)
-      : state.quality.loading ? 'Проверяем…' : 'Нет данных';
-  }
-  if (elements.qualityVerdict) {
-    elements.qualityVerdict.textContent = report
-      ? qualityVerdict(report)
-      : 'Отчёт о качестве ещё не загружен.';
-  }
-  if (elements.qualityMeta) {
-    const scanned = report ? qualityNum(report.scannedCases) : 0;
-    const total = report ? qualityNum(report.total) : 0;
-    elements.qualityMeta.textContent = report
-      ? 'Проверено ' + scanned + ' ' + plural(scanned, 'кейс', 'кейса', 'кейсов') + ' · ' + total + ' ' + plural(total, 'проблема', 'проблемы', 'проблем')
+  if (elements.triageScanned) {
+    elements.triageScanned.textContent = report
+      ? 'Проверено ' + report.scannedCases + ' ' + plural(report.scannedCases, 'кейс', 'кейса', 'кейсов') + ' · ' + report.candidatePairs + ' ' + plural(report.candidatePairs, 'пара', 'пары', 'пар')
       : '';
   }
-  if (elements.qualityCountHigh) elements.qualityCountHigh.textContent = String(report ? qualityNum(report.high) : 0);
-  if (elements.qualityCountMedium) elements.qualityCountMedium.textContent = String(report ? qualityNum(report.medium) : 0);
-  if (elements.qualityCountLow) elements.qualityCountLow.textContent = String(report ? qualityNum(report.low) : 0);
-  if (elements.qualitySource) {
-    elements.qualitySource.textContent = report && report.source === 'rules+ai' ? 'Правила + ИИ' : 'Правила';
-  }
-  if (elements.qualityGenerated) {
+  if (elements.triageSource) elements.triageSource.textContent = triageSourceLabel(report);
+  if (elements.triageGenerated) {
     const timestamp = report ? notificationTimestamp(report.generatedAt) : null;
-    elements.qualityGenerated.textContent = timestamp === null ? '' : 'Обновлено ' + formatRelative(timestamp);
+    elements.triageGenerated.textContent = timestamp === null ? '' : 'Обновлено ' + formatRelative(timestamp);
   }
-  if (elements.qualityTruncated) elements.qualityTruncated.hidden = !(report && report.truncated);
-  if (elements.qualityAiStatus) {
-    const text = qualityAiStatusText(report);
-    elements.qualityAiStatus.hidden = !text;
-    elements.qualityAiStatus.textContent = text;
-    elements.qualityAiStatus.classList.toggle('is-error', Boolean(state.quality.aiError) && !state.quality.scanning);
+  if (elements.triageTruncated) elements.triageTruncated.hidden = !(report && report.truncated);
+  if (elements.triageAiStatus) {
+    const text = triageAiStatusText(report);
+    elements.triageAiStatus.hidden = !text;
+    elements.triageAiStatus.textContent = text;
+    elements.triageAiStatus.classList.toggle('is-error', Boolean(state.triage.aiError) && !state.triage.scanning);
   }
-  if (elements.qualityError) {
-    const error = state.quality.loading ? '' : (state.quality.error || '');
-    elements.qualityError.hidden = !error;
-    elements.qualityError.textContent = error ? 'Не удалось загрузить отчёт: ' + error : '';
+  if (elements.triageError) {
+    const error = state.triage.loading ? '' : (state.triage.error || '');
+    elements.triageError.hidden = !error;
+    elements.triageError.textContent = error ? 'Не удалось загрузить дубли: ' + error : '';
   }
-  const focus = state.quality.focusCaseId;
-  if (elements.qualityFocus) elements.qualityFocus.hidden = !focus;
-  if (focus && elements.qualityFocusCase) elements.qualityFocusCase.textContent = qualityFocusCaseLabel(focus);
-  renderQualityFilters(report);
-  renderQualityFindings(report);
+  const focus = state.triage.focusCaseId;
+  if (elements.triageFocus) elements.triageFocus.hidden = !focus;
+  if (focus && elements.triageFocusCase) elements.triageFocusCase.textContent = triageFocusCaseLabel(focus);
+  const list = elements.triageList;
+  if (list) {
+    list.replaceChildren();
+    if (report) {
+      for (const cluster of triageScopedClusters()) list.append(triageClusterNode(cluster));
+    }
+  }
+  if (elements.triageEmpty) {
+    const visibleCount = list ? list.children.length : 0;
+    elements.triageEmpty.hidden = !report || visibleCount > 0;
+    elements.triageEmpty.textContent = report && report.counts.groups
+      ? 'По выбранному кейсу дублей нет.'
+      : 'Групп дублей не найдено.';
+  }
 }
 
-function openQualityPanel(options = {}) {
-  if (!qualityEnabled() || !state.quality.report) return;
+function openTriagePanel(options = {}) {
+  if (!triageEnabled() || !state.triage.report) return;
   const caseId = options && options.caseId ? String(options.caseId) : null;
   if (state.assistant.open) closeAssistant();
   if (state.routing.queueOpen) closeRoutingPanel();
   closeNotificationPanel();
-  if (caseId) {
-    state.quality.focusCaseId = caseId;
-    state.quality.filterType = 'all';
-  }
-  state.quality.open = true;
-  if (elements.qualityPanel) elements.qualityPanel.hidden = false;
-  if (elements.qualityChip) elements.qualityChip.setAttribute('aria-expanded', 'true');
-  renderQualityPanel();
-  if (elements.qualityTitle) elements.qualityTitle.focus({ preventScroll: true });
+  if (caseId) state.triage.focusCaseId = caseId;
+  state.triage.open = true;
+  if (elements.triagePanel) elements.triagePanel.hidden = false;
+  if (elements.triageChip) elements.triageChip.setAttribute('aria-expanded', 'true');
+  renderTriagePanel();
+  if (elements.triageTitle) elements.triageTitle.focus({ preventScroll: true });
+  maybeAutoScanTriage();
 }
 
-function closeQualityPanel(options = {}) {
-  const wasOpen = state.quality.open;
-  state.quality.open = false;
-  if (elements.qualityPanel) elements.qualityPanel.hidden = true;
-  if (elements.qualityChip) elements.qualityChip.setAttribute('aria-expanded', 'false');
-  if (wasOpen && options.restoreFocus !== false && elements.qualityChip && !elements.qualityChip.hidden) {
-    elements.qualityChip.focus({ preventScroll: true });
+function closeTriagePanel(options = {}) {
+  const wasOpen = state.triage.open;
+  state.triage.open = false;
+  if (elements.triagePanel) elements.triagePanel.hidden = true;
+  if (elements.triageChip) elements.triageChip.setAttribute('aria-expanded', 'false');
+  if (wasOpen && options.restoreFocus !== false && elements.triageChip && !elements.triageChip.hidden) {
+    elements.triageChip.focus({ preventScroll: true });
   }
 }
 
-function toggleQualityPanel() {
-  if (state.quality.open) closeQualityPanel();
-  else openQualityPanel();
+function toggleTriagePanel() {
+  if (state.triage.open) closeTriagePanel();
+  else openTriagePanel();
 }
 
-function queueQualityRefresh() {
-  if (!qualityEnabled()) return Promise.resolve(null);
-  if (state.quality.preserveAi) return Promise.resolve(state.quality.report);
-  if (qualityRequest) return qualityRequest;
-  qualityRequest = (async () => {
-    state.quality.loading = true;
-    renderQualityPanel();
+function maybeAutoScanTriage() {
+  if (!triageAiEnabled() || state.triage.autoScanned || state.triage.scanning) return;
+  if (!state.triage.report) return;
+  state.triage.autoScanned = true;
+  scanTriageSemantics();
+}
+
+function queueTriageRefresh() {
+  if (!triageEnabled()) return Promise.resolve(null);
+  if (state.triage.preserveAi && state.triage.reportSignature === incidentCaseSignature()) return Promise.resolve(state.triage.report);
+  if (state.triage.preserveAi) state.triage.preserveAi = false;
+  if (triageRequest) return triageRequest;
+  triageRequest = (async () => {
+    state.triage.loading = true;
+    renderTriagePanel();
     try {
-      const report = await api('/api/v1/quality');
+      const report = await api('/api/v1/triage');
       if (!state.user) return null;
-      applyQualityReport(report);
+      applyTriageReport(report);
       render();
-      renderQualityPanel();
-      return state.quality.report;
+      renderTriagePanel();
+      return state.triage.report;
     } catch (error) {
       if (error.status === 401) {
         handleUnauthorized();
         return null;
       }
-      state.quality.error = error.message;
-      renderQualityPanel();
+      state.triage.error = triageLoadError(error);
+      if (error.payload && error.payload.code === 'triage_disabled') state.triage.report = null;
+      renderTriagePanel();
       return null;
     } finally {
-      state.quality.loading = false;
-      qualityRequest = null;
-      renderQualityChip();
-      renderQualityPanel();
+      state.triage.loading = false;
+      triageRequest = null;
+      renderTriageChip();
+      renderTriagePanel();
     }
   })();
-  return qualityRequest;
+  return triageRequest;
 }
 
-async function scanQualitySemantics() {
-  if (!qualityAiEnabled() || state.quality.scanning) return;
-  state.quality.scanning = true;
-  state.quality.aiError = null;
-  renderQualityPanel();
+async function scanTriageSemantics() {
+  if (!triageAiEnabled() || state.triage.scanning) return;
+  state.triage.scanning = true;
+  state.triage.aiError = null;
+  renderTriagePanel();
   try {
-    const report = await api('/api/v1/quality/scan', { method: 'POST', body: {} });
-    applyQualityReport(report);
+    const report = await api('/api/v1/triage/scan', { method: 'POST', body: {} });
+    applyTriageReport(report);
     render();
-    renderQualityPanel();
-    const total = state.quality.report ? qualityNum(state.quality.report.total) : 0;
-    showToast('Качество проверено', 'Найдено ' + total + ' ' + plural(total, 'проблема', 'проблемы', 'проблем'), false);
+    renderTriagePanel();
   } catch (error) {
     if (error.status === 401) handleUnauthorized();
-    else state.quality.aiError = error.message;
+    else state.triage.aiError = triageLoadError(error);
   } finally {
-    state.quality.scanning = false;
-    renderQualityPanel();
+    state.triage.scanning = false;
+    renderTriageChip();
+    renderTriagePanel();
   }
 }
 
-function openQualityCase(caseId) {
-  if (caseId === undefined || caseId === null || caseId === '') return;
-  const key = String(caseId);
-  const incident = state.incidents.find(item => String(item.caseId) === key || String(item.id) === key);
+function triageCaseClusterNode(cluster) {
+  const item = document.createElement('li');
+  item.className = 'triage-case-item';
+  const head = document.createElement('div');
+  head.className = 'triage-case-item-head';
+  const badge = document.createElement('span');
+  badge.className = 'triage-badge triage-badge--merge';
+  badge.textContent = 'Дубли';
+  head.append(badge);
+  if (cluster.confidence) {
+    const confidence = document.createElement('span');
+    confidence.className = 'triage-confidence triage-confidence--' + cluster.confidence;
+    confidence.textContent = triageConfidenceLabel(cluster.confidence);
+    head.append(confidence);
+  }
+  item.append(head);
+  const detail = document.createElement('p');
+  detail.className = 'triage-case-detail';
+  detail.textContent = 'Кейсы: ' + cluster.cases.map(info => info.incidentId || info.caseId).join(', ');
+  item.append(detail);
+  const actions = document.createElement('div');
+  actions.className = 'triage-case-item-actions';
+  const merge = document.createElement('button');
+  merge.type = 'button';
+  merge.className = 'button button-primary button-sm';
+  merge.dataset.triageMerge = cluster.caseIds.join('|');
+  merge.dataset.triageTarget = cluster.preferredTarget;
+  merge.textContent = 'Объединить ' + cluster.caseIds.length + ' ' + plural(cluster.caseIds.length, 'кейс', 'кейса', 'кейсов');
+  actions.append(merge);
+  item.append(actions);
+  return item;
+}
+
+function renderTriageCaseBlock(incident) {
+  const panel = elements.triageCasePanel;
+  if (!panel) return;
+  const enabled = triageEnabled();
+  const report = enabled ? state.triage.report : null;
+  panel.hidden = !enabled || !report;
+  if (panel.hidden) return;
+  const clusters = (state.triage.clusters || []).filter(cluster => triageClusterMatches(cluster, incident.caseId));
+  if (elements.triageCaseSource) elements.triageCaseSource.textContent = triageSourceLabel(report);
+  if (elements.triageCaseSummary) {
+    elements.triageCaseSummary.textContent = clusters.length
+      ? 'Найдено групп: ' + clusters.length
+      : 'Похожих кейсов не найдено';
+  }
+  const list = elements.triageCaseList;
+  if (list) {
+    list.replaceChildren();
+    for (const cluster of clusters) list.append(triageCaseClusterNode(cluster));
+  }
+  if (elements.triageCaseEmpty) elements.triageCaseEmpty.hidden = clusters.length > 0;
+}
+
+function openTriageCase(caseId) {
+  const incident = triageIncidentFor(caseId);
   if (!incident) {
-    showToast('Инцидент недоступен', 'Кейс не найден в текущем списке', false);
+    showToast('Кейс недоступен', 'Кейс не найден в текущем списке', false);
     return;
   }
-  closeQualityPanel({ restoreFocus: false });
+  closeTriagePanel({ restoreFocus: false });
   openIncident(incident.caseId);
 }
 
-function onQualityFindingsClick(event) {
-  const button = event.target.closest('[data-quality-open]');
-  if (!button) return;
-  openQualityCase(button.dataset.qualityOpen);
+function onTriageActionClick(event) {
+  const open = event.target.closest('[data-triage-open]');
+  if (open) {
+    openTriageCase(open.dataset.triageOpen);
+    return;
+  }
+  const merge = event.target.closest('[data-triage-merge]');
+  if (!merge) return;
+  const ids = String(merge.dataset.triageMerge || '').split('|').filter(Boolean);
+  const cluster = merge.closest('.triage-cluster');
+  const select = cluster ? cluster.querySelector('.triage-cluster-target') : null;
+  const preferredTarget = select ? select.value : (merge.dataset.triageTarget || null);
+  openMergeDialog(ids, { preferredTarget });
 }
 
-function onQualityFilterClick(event) {
-  const button = event.target.closest('[data-quality-type]');
-  if (!button) return;
-  state.quality.filterType = button.dataset.qualityType || 'all';
-  renderQualityPanel();
+/* ------------------------------------------------------- cluster merge */
+
+function openMergeDialog(caseIds, options = {}) {
+  if (!triageEnabled()) return;
+  const unique = [...new Set((Array.isArray(caseIds) ? caseIds : [caseIds]).map(id => triageText(id)).filter(Boolean))];
+  if (unique.length < 2) return;
+  const cases = unique.map(caseId => triageCaseInfo(caseId));
+  if (cases.some(info => info.version === null)) {
+    showToast('Кейс не найден', 'Не удалось получить версии кейсов — обновите список', false);
+    return;
+  }
+  const preferred = options && options.preferredTarget && unique.includes(String(options.preferredTarget))
+    ? String(options.preferredTarget)
+    : null;
+  state.triage.merge = {
+    caseIds: unique,
+    targetCaseId: preferred || triagePickTarget(cases),
+    busy: false,
+    error: null
+  };
+  if (!elements.mergeDialog) return;
+  renderMergeDialog();
+  if (!elements.mergeDialog.open) elements.mergeDialog.showModal();
+  syncMergeDialogState();
 }
 
-function resetQuality() {
-  closeQualityPanel({ restoreFocus: false });
-  state.quality.report = null;
-  state.quality.counts = new Map();
-  state.quality.loading = false;
-  state.quality.scanning = false;
-  state.quality.error = null;
-  state.quality.aiError = null;
-  state.quality.filterType = 'all';
-  state.quality.focusCaseId = null;
-  state.quality.preserveAi = false;
-  renderQualityChip();
+function renderMergeDialog() {
+  const merge = state.triage.merge;
+  const container = elements.mergeOptions;
+  if (!merge || !container) return;
+  container.replaceChildren();
+  for (const caseId of merge.caseIds) {
+    const info = triageCaseInfo(caseId);
+    const label = document.createElement('label');
+    label.className = 'merge-option';
+    label.dataset.mergeCase = info.caseId;
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'merge-target';
+    input.value = info.caseId;
+    input.checked = String(info.caseId) === String(merge.targetCaseId);
+    const body = document.createElement('span');
+    body.className = 'merge-option-body';
+    const tag = document.createElement('span');
+    tag.className = 'merge-option-tag';
+    tag.textContent = input.checked ? 'Целевой' : 'Источник';
+    const title = document.createElement('strong');
+    title.textContent = (info.incidentId || info.caseId) + ' · ' + info.title;
+    const meta = document.createElement('span');
+    meta.className = 'merge-option-meta';
+    const parts = [];
+    if (info.team) parts.push('Команда: ' + info.team);
+    if (info.startedAt) parts.push('Возникло: ' + formatRelative(info.startedAt));
+    parts.push('Затронуто: ' + formatNumber(info.affectedUsers));
+    meta.textContent = parts.join(' · ');
+    body.append(tag, title, meta);
+    label.append(input, body);
+    container.append(label);
+  }
+  if (elements.mergeTitle) elements.mergeTitle.textContent = 'Объединение кейсов';
 }
 
+function triageMergeCases(merge) {
+  if (!merge) return [];
+  return merge.caseIds.map(caseId => triageCaseInfo(caseId));
+}
+
+function syncMergeDialogState() {
+  const merge = state.triage.merge;
+  if (!merge) return;
+  const cases = triageMergeCases(merge);
+  const target = triageCaseInfo(merge.targetCaseId);
+  const sources = cases.filter(info => String(info.caseId) !== String(merge.targetCaseId));
+  const labels = elements.mergeOptions ? [...elements.mergeOptions.querySelectorAll('.merge-option')] : [];
+  for (const label of labels) {
+    const isTarget = String(label.dataset.mergeCase) === String(merge.targetCaseId);
+    label.classList.toggle('is-selected', isTarget);
+    const tag = label.querySelector('.merge-option-tag');
+    if (tag) tag.textContent = isTarget ? 'Целевой' : 'Источник';
+    const input = label.querySelector('input[name="merge-target"]');
+    if (input) input.checked = isTarget;
+  }
+  if (elements.mergeSubtitle) {
+    elements.mergeSubtitle.textContent = sources.length + ' ' + plural(sources.length, 'кейс', 'кейса', 'кейсов') + ' будут объединены в «' + (target.incidentId || target.caseId) + '». Целевой кейс сохранится.';
+  }
+  const teams = [...new Set(cases.map(info => info.team).filter(Boolean))];
+  if (elements.mergeWarning) {
+    const crossTeam = teams.length > 1;
+    elements.mergeWarning.hidden = !crossTeam;
+    elements.mergeWarning.textContent = crossTeam
+      ? 'Команды различаются: ' + teams.join(', ') + '. Команда целевого кейса «' + (target.team || 'не назначена') + '» останется без изменений.'
+      : '';
+  }
+  if (elements.mergeNote) {
+    elements.mergeNote.textContent = 'Команда целевого кейса сохранится: ' + (target.team || 'не назначена') + '. Источники, история и уведомления перейдут в целевой кейс.';
+  }
+  const blocked = cases.some(info => info.version === null);
+  if (elements.mergeConfirm) {
+    elements.mergeConfirm.disabled = Boolean(merge.busy || blocked);
+    const total = merge.caseIds.length;
+    elements.mergeConfirm.textContent = merge.busy ? 'Объединяем…' : 'Объединить ' + total + ' ' + plural(total, 'кейс', 'кейса', 'кейсов');
+  }
+  if (elements.mergeError) {
+    elements.mergeError.hidden = !merge.error;
+    elements.mergeError.textContent = merge.error || '';
+  }
+}
+
+function onMergeTargetChange(event) {
+  const input = event.target.closest('input[name="merge-target"]');
+  if (!input || !state.triage.merge) return;
+  state.triage.merge.targetCaseId = input.value;
+  state.triage.merge.error = null;
+  syncMergeDialogState();
+}
+
+function triageMergeError(error) {
+  const code = error && error.payload ? error.payload.code : '';
+  if (code === 'triage_disabled') return 'Дубли отключены на сервере.';
+  if (error.status === 409) {
+    if (code === 'case_closed') return 'Кейс уже закрыт — объединение недоступно.';
+    if (code === 'lifecycle_mismatch') return 'Объединять можно только активные с активными или исследование с исследованием.';
+    if (code === 'case_not_open') return 'Кейс уже не открыт — обновите данные и попробуйте снова.';
+    return 'Кейс изменился (конфликт версий). Данные обновлены, попробуйте снова.';
+  }
+  if (error.status === 404) return 'Целевой или исходный кейс не найден.';
+  return error.message || 'Не удалось объединить кейсы.';
+}
+
+async function confirmTriageMerge() {
+  const merge = state.triage.merge;
+  if (!merge || merge.busy) return;
+  const cases = triageMergeCases(merge);
+  const target = triageCaseInfo(merge.targetCaseId);
+  const sources = cases.filter(info => String(info.caseId) !== String(merge.targetCaseId));
+  if (!target || !sources.length) {
+    merge.error = 'Не удалось определить кейсы для объединения — обновите данные.';
+    syncMergeDialogState();
+    return;
+  }
+  if (target.version === null || sources.some(info => info.version === null)) {
+    merge.error = 'Не удалось определить версию кейса — обновите данные.';
+    syncMergeDialogState();
+    return;
+  }
+  merge.busy = true;
+  merge.error = null;
+  syncMergeDialogState();
+  const expectedVersions = {};
+  for (const source of sources) expectedVersions[source.caseId] = source.version;
+  const body = {
+    sourceCaseIds: sources.map(source => source.caseId),
+    expectedVersions,
+    expectedVersion: target.version
+  };
+  if (sources.length === 1) {
+    body.sourceCaseId = sources[0].caseId;
+    body.expectedSourceVersion = sources[0].version;
+  }
+  try {
+    await api('/api/v1/cases/' + encodeURIComponent(target.caseId) + '/merge', { method: 'POST', body });
+    const sourceIds = sources.map(source => source.caseId);
+    const total = merge.caseIds.length;
+    closeMergeDialog();
+    if (state.activeId && sourceIds.includes(String(state.activeId))) elements.dialog.close();
+    state.triage.preserveAi = false;
+    showToast('Кейсы объединены', total + ' ' + plural(total, 'кейс', 'кейса', 'кейсов') + ' → ' + (target.id || target.caseId));
+    await queueRefresh({ notify: false });
+  } catch (error) {
+    if (error.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+    if (state.triage.merge) state.triage.merge.error = triageMergeError(error);
+    if (error.status === 409) {
+      state.triage.preserveAi = false;
+      queueRefresh({ notify: false }).catch(() => {});
+    }
+  } finally {
+    if (state.triage.merge) {
+      state.triage.merge.busy = false;
+      syncMergeDialogState();
+    }
+  }
+}
+
+function closeMergeDialog() {
+  state.triage.merge = null;
+  if (elements.mergeDialog && elements.mergeDialog.open) elements.mergeDialog.close();
+}
+
+function resetTriage() {
+  closeTriagePanel({ restoreFocus: false });
+  closeMergeDialog();
+  state.triage.report = null;
+  state.triage.clusters = [];
+  state.triage.loading = false;
+  state.triage.scanning = false;
+  state.triage.autoScanned = false;
+  state.triage.error = null;
+  state.triage.aiError = null;
+  state.triage.focusCaseId = null;
+  state.triage.preserveAi = false;
+  renderTriageChip();
+}
+
+/* --------------------------------------------------------------- rendering */
 /* --------------------------------------------------------------- rendering */
 
 
@@ -1541,7 +1809,6 @@ function renderCard(incident, group) {
       <div class="card-topline">
         <div class="card-topline-main">
           ${priorityBadge(incident)}
-          ${qualityBadgeFor(incident)}
         </div>
         <a class="card-itsm" href="${itsmUrl(incident)}" target="_blank" rel="noopener noreferrer" aria-label="Открыть ${escapeHtml(incident.id)} в ITSM">${icon('external')}</a>
       </div>
@@ -1549,9 +1816,9 @@ function renderCard(incident, group) {
       <h3><button class="card-open" type="button" data-open-incident="${caseId}">${escapeHtml(incident.title)}</button></h3>
       <dl class="card-meta">
         <div><dt>Возникло</dt><dd>${incident.startedAt ? dateTime.format(incident.startedAt) : '—'}</dd></div>
-        <div><dt>Исполнитель</dt><dd>${escapeHtml(coordinator)}</dd></div>
+        <div><dt>Координатор</dt><dd>${escapeHtml(coordinator)}</dd></div>
+        <div><dt>Команда</dt><dd class="card-team${incident.team ? '' : ' is-empty'}">${escapeHtml(incident.team || 'Не назначена')}</dd></div>
         <div><dt>Срок</dt><dd class="${dueClass}">${due}</dd></div>
-        <div><dt>Сервис</dt><dd>${escapeHtml(incident.service || '—')}</dd></div>
       </dl>
       ${flags.length ? '<div class="card-flags">' + flags.join('') + '</div>' : ''}
       <div class="sla-track ${toneClass(progress.tone)}" aria-hidden="true"><span class="sla-fill" data-sla-fill="${caseId}" style="inline-size:${progress.pct}%"></span></div>
@@ -1593,14 +1860,16 @@ function getFilteredIncidents(list, { applyRisk = false } = {}) {
     const matchesSearch = !query || haystack.includes(query);
     const matchesProduct = state.filters.product === 'all' || incident.product === state.filters.product;
     const matchesRisk = !applyRisk || !state.filters.riskOnly || isSlaRisk(incident);
-    return matchesSearch && matchesProduct && matchesRisk;
+    const matchesCoordinator = !state.filters.unassigned
+      || (!incident.coordinatorId && !incident.coordinatorName);
+    return matchesSearch && matchesProduct && matchesRisk && matchesCoordinator;
   });
 }
 
 function isInProgress(incident) {
   return incident.groups.includes('active')
     && Boolean(incident.team)
-    && !incident.groups.some(group => ['critical', 'high', 'coordination', 'research'].includes(group));
+    && !incident.groups.includes('research');
 }
 
 function renderGroups() {
@@ -1753,7 +2022,7 @@ function rebuildProducts() {
 }
 
 function renderToolbarState() {
-  elements.reset.disabled = !state.filters.search && state.filters.product === 'all' && !state.filters.riskOnly;
+  elements.reset.disabled = !state.filters.search && state.filters.product === 'all' && !state.filters.riskOnly && !state.filters.unassigned;
   elements.risk.disabled = state.filters.archive;
 }
 
@@ -1843,7 +2112,7 @@ function render() {
   renderToolbarState();
   renderSyncState();
   renderLive();
-  renderQualityChip();
+  renderTriageChip();
   renderAssistantChip();
   renderRoutingQueueButton();
   if (state.activeId && findIncident(state.activeId)) {
@@ -1930,7 +2199,7 @@ function syncAssistantVisibility() {
 function openAssistant() {
   if (!elements.assistantButton || elements.assistantButton.hidden) return;
   if (state.routing.queueOpen) closeRoutingPanel();
-  if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+  if (state.triage.open) closeTriagePanel({ restoreFocus: false });
   state.assistant.open = true;
   elements.assistantPanel.hidden = false;
   elements.assistantButton.setAttribute('aria-expanded', 'true');
@@ -2270,7 +2539,7 @@ function focusTeamSelect() {
 function openRoutingPanel() {
   if (!elements.routingPanel || meta().routingEnabled === false || !state.user) return;
   if (state.assistant.open) closeAssistant();
-  if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+  if (state.triage.open) closeTriagePanel({ restoreFocus: false });
   state.routing.queueOpen = true;
   elements.routingPanel.hidden = false;
   elements.routingQueueButton.setAttribute('aria-expanded', 'true');
@@ -2906,6 +3175,17 @@ function updateClaimButton(incident) {
   claim.textContent = claimedByMe ? 'Вы — координатор' : 'Взять в координацию';
 }
 
+function updateTakeWorkButton(incident) {
+  const button = elements.takeWorkButton;
+  if (!button) return;
+  const active = incident.groups.includes('active');
+  button.hidden = !active;
+  const mine = Boolean(state.user) && incident.coordinatorId === state.user.id;
+  const performing = incident.stateId === 2;
+  button.disabled = mine && performing;
+  button.textContent = mine && performing ? 'Инцидент в работе' : 'Взять в работу';
+}
+
 function populatePriorityInfo(incident) {
   setText('#priority-auto-value', `Автоматический: ${priorityLabel(incident.autoPriorityId)}`);
   const warning = document.querySelector('#priority-warning');
@@ -3034,6 +3314,7 @@ function clearDialogMessages() {
 function populateActions(incident, { resetInputs = false } = {}) {
   setActionVisibility(incident);
   updateClaimButton(incident);
+  updateTakeWorkButton(incident);
   populatePriorityInfo(incident);
   if (resetInputs) {
     populateCoordinatorSelect(incident);
@@ -3068,6 +3349,7 @@ function populateDialog(incident, { resetInputs = false } = {}) {
   document.querySelector('#dialog-badges').innerHTML = dialogBadges(incident);
   populateSla(incident);
   populateDetails(incident);
+  renderTriageCaseBlock(incident);
   populateActions(incident, { resetInputs });
   document.querySelector('#itsm-link').href = itsmUrl(incident);
   if (resetInputs) {
@@ -3368,6 +3650,28 @@ async function claimIncident() {
   await performAction(incident, 'claim', {});
 }
 
+async function takeIncidentToWork() {
+  const incident = currentIncident();
+  if (!incident || !incident.groups.includes('active')) return;
+  const mine = Boolean(state.user) && incident.coordinatorId === state.user.id;
+  if (!mine) {
+    const claimed = await performAction(incident, 'claim', {});
+    if (!claimed) return;
+  }
+  const updated = currentIncident();
+  if (!updated) return;
+  if (updated.stateId !== 2 && transitionsFor(updated.stateId).includes(2)) {
+    const moved = await performAction(updated, 'status', { stateId: 2, solution: null });
+    if (!moved) return;
+  }
+  const finalIncident = currentIncident() || updated;
+  showToast(
+    finalIncident.stateId === 2 ? 'Взято в работу' : 'Инцидент взят в координацию',
+    finalIncident.id,
+    false
+  );
+}
+
 async function clearPriorityOverride() {
   const incident = currentIncident();
   if (!incident) return;
@@ -3621,25 +3925,6 @@ async function onAdminUserAction(event) {
   }
 }
 
-async function adminDemo(kind, button) {
-  if (button) button.disabled = true;
-  try {
-    const data = await api(`/api/v1/admin/demo/${kind}`, { method: 'POST' });
-    await queueRefresh({ notify: true });
-    await loadAdminSystem();
-    showToast(
-      kind === 'critical' ? 'Критический инцидент создан' : 'Шаг демо выполнен',
-      `Добавлено ${data.added ?? 0} · обновлено ${data.updated ?? 0} · ревизия ${data.revision ?? '—'}`
-    );
-  } catch (error) {
-    if (error.status === 401) { handleUnauthorized(); return; }
-    adminSetError(error.message, { system: true });
-    showToast('Ошибка демо', error.message, true);
-  } finally {
-    if (button) button.disabled = false;
-  }
-}
-
 async function onAdminReset() {
   const button = document.querySelector('#admin-reset');
   if (!button) return;
@@ -3723,15 +4008,16 @@ async function logout() {
   closeEvents();
   setUser(null);
   resetNotifications();
-  resetQuality();
+  resetTriage();
   state.incidents = [];
   state.counts = null;
   state.lastSyncedAt = null;
   state.syncError = null;
-  state.filters = { search: '', product: 'all', riskOnly: false, archive: false };
+  state.filters = { search: '', product: 'all', riskOnly: false, unassigned: false, archive: false };
   elements.search.value = '';
   elements.product.value = 'all';
   elements.risk.checked = false;
+  elements.coordinator.checked = false;
   resetAssistantUi();
   resetRoutingUi();
   resetPostmortem({ abort: true, clearHistory: true, clearCache: true });
@@ -3781,8 +4067,6 @@ function bindEvents() {
     await syncNow();
     loadAdminSystem().catch(() => {});
   });
-  document.querySelector('#admin-tick').addEventListener('click', event => adminDemo('tick', event.currentTarget));
-  document.querySelector('#admin-critical').addEventListener('click', event => adminDemo('critical', event.currentTarget));
   document.querySelector('#admin-reset').addEventListener('click', onAdminReset);
 
   elements.search.addEventListener('input', event => {
@@ -3797,13 +4081,19 @@ function bindEvents() {
     state.filters.riskOnly = event.target.checked;
     applyFilters();
   });
+  elements.coordinator.addEventListener('change', event => {
+    state.filters.unassigned = event.target.checked;
+    applyFilters();
+  });
   elements.reset.addEventListener('click', () => {
     state.filters.search = '';
     state.filters.product = 'all';
     state.filters.riskOnly = false;
+    state.filters.unassigned = false;
     elements.search.value = '';
     elements.product.value = 'all';
     elements.risk.checked = false;
+    elements.coordinator.checked = false;
     applyFilters();
     elements.search.focus();
   });
@@ -3819,23 +4109,26 @@ function bindEvents() {
   elements.notificationReadAll.addEventListener('click', markAllNotificationsRead);
   elements.notificationList.addEventListener('click', onNotificationClick);
 
-  elements.qualityChip.addEventListener('click', toggleQualityPanel);
-  elements.qualityClose.addEventListener('click', () => closeQualityPanel());
-  elements.qualityAiButton.addEventListener('click', scanQualitySemantics);
-  elements.qualityFilters.addEventListener('click', onQualityFilterClick);
-  elements.qualityFindings.addEventListener('click', onQualityFindingsClick);
-  elements.qualityFocusClear.addEventListener('click', () => {
-    state.quality.focusCaseId = null;
-    renderQualityPanel();
+  elements.triageChip.addEventListener('click', toggleTriagePanel);
+  elements.triageClose.addEventListener('click', () => closeTriagePanel());
+  elements.triageList.addEventListener('click', onTriageActionClick);
+  elements.triageCaseList.addEventListener('click', onTriageActionClick);
+  elements.triageFocusClear.addEventListener('click', () => {
+    state.triage.focusCaseId = null;
+    renderTriagePanel();
   });
+  elements.triageCaseOpen.addEventListener('click', () => {
+    if (state.activeId) openTriagePanel({ caseId: state.activeId });
+  });
+  elements.takeWorkButton.addEventListener('click', takeIncidentToWork);
+  elements.mergeOptions.addEventListener('change', onMergeTargetChange);
+  elements.mergeConfirm.addEventListener('click', confirmTriageMerge);
+  elements.mergeCancel.addEventListener('click', () => closeMergeDialog());
+  elements.mergeClose.addEventListener('click', () => closeMergeDialog());
+  elements.mergeDialog.addEventListener('close', () => { state.triage.merge = null; });
 
   document.addEventListener('click', event => {
     if (state.notifications.open && !event.target.closest('#notification-bell-wrap')) closeNotificationPanel();
-    const qualityTrigger = event.target.closest('[data-quality-case]');
-    if (qualityTrigger) {
-      openQualityPanel({ caseId: qualityTrigger.dataset.qualityCase });
-      return;
-    }
     const trigger = event.target.closest('[data-open-incident]');
     if (trigger) openIncident(trigger.dataset.openIncident);
   });
@@ -3914,26 +4207,26 @@ function bindEvents() {
   elements.postmortemDownload.addEventListener('click', downloadPostmortem);
   document.addEventListener('keydown', event => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
-      if (elements.dialog.open || (elements.adminDialog && elements.adminDialog.open)) return;
+      if (elements.dialog.open || (elements.adminDialog && elements.adminDialog.open) || triageModalOpen()) return;
       event.preventDefault();
       openAssistant();
       return;
     }
-    if (event.key === 'Escape' && state.quality.open && !elements.dialog.open) {
-      closeQualityPanel();
+    if (event.key === 'Escape' && state.triage.open && !elements.dialog.open && !triageModalOpen()) {
+      closeTriagePanel();
       return;
     }
-    if (event.key === 'Escape' && state.notifications.open) {
+    if (event.key === 'Escape' && state.notifications.open && !triageModalOpen()) {
       closeNotificationPanel();
       elements.notificationBell.focus();
       return;
     }
-    if (event.key === 'Escape' && state.routing.queueOpen && !elements.dialog.open && !(elements.adminDialog && elements.adminDialog.open)) {
+    if (event.key === 'Escape' && state.routing.queueOpen && !elements.dialog.open && !(elements.adminDialog && elements.adminDialog.open) && !triageModalOpen()) {
       closeRoutingPanel();
       elements.routingQueueButton.focus();
       return;
     }
-    if (event.key === 'Escape' && state.assistant.open && !elements.dialog.open && !(elements.adminDialog && elements.adminDialog.open)) {
+    if (event.key === 'Escape' && state.assistant.open && !elements.dialog.open && !(elements.adminDialog && elements.adminDialog.open) && !triageModalOpen()) {
       closeAssistant();
       elements.assistantButton.focus();
     }
