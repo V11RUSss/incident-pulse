@@ -33,6 +33,19 @@ function canonicalSignature(canonical) {
   return serialize(copy);
 }
 
+function notificationView(row) {
+  return {
+    id: row.id,
+    caseId: row.case_id,
+    incidentId: row.incident_id,
+    type: row.type,
+    title: row.title,
+    message: row.message,
+    createdAt: row.created_at,
+    readAt: row.read_at
+  };
+}
+
 class Store {
   constructor(dataDir) {
     fs.mkdirSync(dataDir, { recursive: true });
@@ -109,6 +122,20 @@ class Store {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS audit_id_idx ON audit(id DESC);
+
+      CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        case_id TEXT,
+        incident_id TEXT,
+        type TEXT NOT NULL,
+        title TEXT NOT NULL,
+        message TEXT,
+        created_at INTEGER NOT NULL,
+        read_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS notifications_user_id_idx ON notifications(user_id, id DESC);
+      CREATE INDEX IF NOT EXISTS notifications_read_at_idx ON notifications(user_id, read_at);
     `);
     this.ensureUserRoleColumn();
     this.ensureAdmin();
@@ -222,6 +249,56 @@ class Store {
       details: JSON.parse(row.details_json),
       createdAt: row.created_at
     }));
+  }
+
+  createNotification({
+    userId,
+    caseId = null,
+    incidentId = null,
+    type,
+    title,
+    message = null,
+    createdAt = Date.now()
+  }) {
+    const result = this.db.prepare(`
+      INSERT INTO notifications (user_id, case_id, incident_id, type, title, message, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(userId, caseId, incidentId, type, title, message, createdAt);
+    return this.getNotification(Number(result.lastInsertRowid));
+  }
+
+  getNotification(id) {
+    const row = this.db.prepare('SELECT * FROM notifications WHERE id = ?').get(id);
+    return row ? notificationView(row) : null;
+  }
+
+  listNotifications(userId, limit = 50) {
+    const bounded = Math.min(Math.max(Number.isInteger(limit) ? limit : 50, 1), 200);
+    return this.db.prepare(`
+      SELECT * FROM notifications WHERE user_id = ? ORDER BY id DESC LIMIT ?
+    `).all(userId, bounded).map(notificationView);
+  }
+
+  countUnreadNotifications(userId) {
+    const row = this.db.prepare(`
+      SELECT COUNT(*) AS count FROM notifications WHERE user_id = ? AND read_at IS NULL
+    `).get(userId);
+    return row ? Number(row.count) : 0;
+  }
+
+  markNotificationRead(id, userId, readAt = Date.now()) {
+    const result = this.db.prepare(`
+      UPDATE notifications SET read_at = COALESCE(read_at, ?) WHERE id = ? AND user_id = ?
+    `).run(readAt, id, userId);
+    if (!result.changes) return null;
+    return this.getNotification(id);
+  }
+
+  markAllNotificationsRead(userId, readAt = Date.now()) {
+    const result = this.db.prepare(`
+      UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL
+    `).run(readAt, userId);
+    return Number(result.changes);
   }
 
   createSession(session) {

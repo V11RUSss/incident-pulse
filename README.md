@@ -184,6 +184,24 @@ App формирует canonical case по следующим правилам:
 
 Ручной priority override сохраняется при последующих синхронизациях. Возврат к автоматическому приоритету выполняется отдельным действием; интерфейс показывает источник приоритета и предупреждает о расхождении ручного и автоматического значений. Критические и высокие группы включают только активные случаи с соответствующим effective priority и не дублируются в колонке координации.
 
+## Синхронизация и Live
+
+Одна кнопка **«Синхронизировать»** делает один `POST /api/v1/sync/itsm`
+и показывает результат. Дублирующая иконка refresh из тулбара удалена.
+
+Индикатор **Live** в верхней панели — переключатель:
+
+- Live ON — подписка SSE `GET /api/v1/events`; app получает `sync`/`incidents`
+  и обновляет доску без перезагрузки;
+- Live OFF — `EventSource` закрыт, новые события не принимаются;
+  ручная синхронизация продолжает работать;
+- выбор хранится в `localStorage` (`incident-pulse-live`);
+- ошибка SSE показывает «Нет связи», но не сбрасывает выбор.
+
+В эмуляторе `DEMO_GENERATION=true`: app каждые 3–9 секунд запускает 1–3 шага mock-генератора (`DEMO_MIN_INTERVAL_MS`/`DEMO_MAX_INTERVAL_MS`, `DEMO_BATCH_MIN`/`DEMO_BATCH_MAX`), затем синхронизируется и рассылает SSE. Интервалы и размер пачки случайные, поэтому инциденты приходят неравномерно. Генератор **не назначает команды и не переводит кейсы в работу** — это делает только координатор. Критические инциденты создаются реже: не чаще одного continuation-шага из двенадцати; по умолчанию остаётся один стартовый критический пример.
+SSE раздаёт изменения браузеру. Это near-real-time, а не webhook от SimpleOne;
+для настоящего push нужен отдельный webhook, но для демо достаточно polling + SSE.
+
 ## Действия координатора и lifecycle
 
 В диалоге случая доступны назначение ответственного, смена координатора, ручной приоритет и возврат к auto, изменение deadline, выбор команды МТС, допустимые статусные переходы и история. Операции выполняются для всех `sourceIds` canonical case через атомарный bulk update mock.
@@ -206,13 +224,52 @@ Claim и передача другому координатору требуют
 - `stateId=0` и `stateId=2` — активная работа; у таких записей `solution=null` и `completionDate=null`;
 - группы отображения взаимоисключающие: critical/high показываются только в своей приоритетной колонке и не дублируются в coordination; в coordination попадают только активные medium/low без `assignedGroupName`;
 - критический или высокий случай без команды всё равно остаётся в своей приоритетной колонке — назначить команду можно из диалога;
-- назначение команды переводит случай в `stateId=2`, убирает его из coordination и сохраняет приоритет, но не переводит сразу в research;
+- назначение команды переводит случай в `stateId=2`, убирает его из coordination, сохраняет приоритет и показывает в секции «В работе», но не переводит сразу в research; после успешного назначения команды диалог закрывается, чтобы карточка была видна на доске; смена приоритета также закрывает диалог, назначение координатора — нет;
 - research соответствует `stateId=20` и заполненному решению; такие случаи не дублируются в active critical/high;
 - `stateId=7` и `stateId=10` переводят случай в архив закрытых.
 
 Сервер проверяет переходы: `0 → 2/20/7/10`, `2 → 20/7/10`, `20 → 7/10`, `7 → 10`, `10 →` без переходов. Недопустимый переход возвращает `409` с понятным сообщением; допустимые переходы клиент получает из `GET /api/v1/meta` (`transitions[String(stateId)]`).
 
-История фиксирует автора, время и содержание действия. SSE обновляет открытые экраны без перезагрузки и сохраняет фильтры и контекст. Уведомления создаются только для реальных изменений; ошибки синхронизации отображаются как `syncError`, а не скрываются.
+История фиксирует автора, время и содержание действия. SSE обновляет открытые экраны без перезагрузки и сохраняет фильтры и контекст. Уведомления создаются только для реальных изменений; ошибки синхронизации отображаются как `syncError`, а не скрываются. Бейджи Master/Effect/source count с карточек удалены; источник остаётся в деталях кейса. Блок легенды внизу страницы удалён.
+
+### Доска и «В работе»
+
+Четыре основные колонки — критические, координация, высокий приоритет,
+исследование. После назначения команды medium/low больше не исчезают: они
+попадают в полноширинную секцию **«В работе»** под доской.
+
+```text
+Критические | На координаторов | Высокий приоритет | Исследование
+────────────────────────────────────────────────────────────────
+В работе · N
+[карточка] [карточка] [карточка]
+```
+
+- «В работе» — вычисляемая display-группа, canonical `groups` не меняются:
+  `active + team` без critical/high/coordination/research;
+- карточка остаётся в поиске, не уходит в архив и не дублируется в других
+  колонках;
+- общий счётчик **«Активные»** не меняется, счётчик секции — это подмножество;
+- при 0 карточек секция и чип скрыты;
+- в data-strip есть чип **«В работе N»**, который прокручивает к секции;
+- при длинной доске слева внизу появляется floating **«В работе N»**, когда секция вне вьюпорта;
+- 3 карточки в ряд на десктопе, 2 на планшете, 1 на мобильном;
+- отдельная вкладка/маршрут не нужны.
+
+## Уведомления координатору
+
+При передаче инцидента другому координатору (`POST /api/v1/incidents/:caseId/coordinator`)
+создаётся targeted-уведомление:
+
+- `notifications` в SQLite, unread/read-at, cascade при удалении пользователя;
+- SSE event `notification` отправляется **только** сессиям получателя;
+- колокольчик в topbar показывает unread, dropdown — список,
+  «Прочитать все», клик открывает кейс и отмечает прочитанным;
+- новое уведомление всплывает обычным non-critical toast и остаётся в колокольчике;
+- критические баннеры/уведомления об инцидентах не затронуты.
+
+API: `GET /api/v1/notifications`, `POST /api/v1/notifications/:id/read`,
+`POST /api/v1/notifications/read-all`.
 
 ## Роли и админ-панель
 
@@ -302,7 +359,7 @@ curl --fail-with-body --silent --show-error \
 
 ### Муляж страницы ITSM
 
-Для primary source id доступна простая HTML-страница без секретов:
+Для primary source id доступна **read-only страница в стиле SimpleOne**: верхний бар, левое меню, хлебные крошки, вкладки «Детали / История / Связанные», сгруппированные поля и правая лента активности. Функциональность декоративная, данные — снимок SSR без секретов:
 
 ```text
 http://localhost:8081/itsm/incidents/<primary-id>/view
@@ -353,6 +410,14 @@ api:
 | `POSTMORTEM_ENABLED` | `true` |
 | `POSTMORTEM_RATE_LIMIT_PER_MIN` | `10` |
 | `POSTMORTEM_TIMEOUT_MS` | `60000` |
+| `QUALITY_ENABLED` | `true` |
+| `QUALITY_AI_ENABLED` | `true` |
+| `QUALITY_AI_RATE_LIMIT_PER_MIN` | `5` |
+| `QUALITY_AI_TIMEOUT_MS` | `20000` |
+| `DEMO_MIN_INTERVAL_MS` | `3000` |
+| `DEMO_MAX_INTERVAL_MS` | `9000` |
+| `DEMO_BATCH_MIN` | `1` |
+| `DEMO_BATCH_MAX` | `3` |
 | `PUBLIC_ORIGIN` | пусто |
 | `COOKIE_SECURE` | `false` |
 | `SESSION_TTL_MS` | `604800000` |
@@ -610,6 +675,30 @@ Content-Type: application/json
 `POSTMORTEM_RATE_LIMIT_PER_MIN`; таймаут `POSTMORTEM_TIMEOUT_MS`;
 флаг `POSTMORTEM_ENABLED=false` скрывает кнопку и endpoint.
 
+### Линтер качества и AI semantic scan
+
+`GET /api/v1/quality` быстро считает детерминированный отчёт по canonical cases:
+
+- активный кейс без команды/координатора;
+- пустой/шаблонный `solution`, solution у активного кейса;
+- дубли по продукту/региону и похожему title;
+- конфликт description со статусом;
+- пропущенные поля и просроченный SLA без эскалации.
+
+`score` считается сервером: `100 - 12*high - 6*medium - 2*low`;
+findings содержат message/evidence/relatedCaseId. В UI — чип «Качество N»,
+бейджи на карточках и drawer с кольцом score, фильтрами и переходом к кейсу.
+
+Кнопка **«Проверить смысл»** вызывает `POST /api/v1/quality/scan`
+(опционально `{caseIds:[]}`, до 20). AI проверяет только выбранные кейсы
+по solution/description/status, возвращает strict JSON с evidence; сервер
+валидирует, дедуплицирует с правилами и пересчитывает score. AI недоступен →
+`source:"rules"`, `aiSkipped:true`, без 5xx. Это on-demand, не на каждом refresh;
+кэш по `caseId+version+solution/description`, rate limit POST.
+
+Флаги: `QUALITY_ENABLED`, `QUALITY_AI_ENABLED`, `QUALITY_AI_RATE_LIMIT_PER_MIN`,
+`QUALITY_AI_TIMEOUT_MS`.
+
 ## Тесты
 
 Тесты используют только встроенный `node:test` и временные каталоги ОС; серверы не запускаются, зависимости не нужны:
@@ -619,7 +708,7 @@ cd services/app && npm test
 cd services/itsm-mock && npm test
 ```
 
-Покрыто: агрегация `affectedUsers`/`activeAffectedUsers` и автоприоритет, взаимоисключающие группы отображения, закрытые источники, ручной override, `STATUS_TRANSITIONS`, идемпотентность `applyDelta`, stale и пустой delta без роста версий, `resetSyncState`, миграция ролей и первый администратор, валидация mock PATCH, карантин `state.json`, эндпоинты `critical`/`reset`, каденция критических событий на 40 tick-ах, keyless-клиент vLLM, очистка Qwen thinking-блока, whitelist-валидация и исполнение фильтров, парсер ассистента и отказ от неизвестных полей, fallback-правила маршрутизации и валидация команды по `MTS_TEAMS`, нормализация истории и fallback постмортема, проверка fact/hypothesis-полей.
+Покрыто: агрегация `affectedUsers`/`activeAffectedUsers` и автоприоритет, взаимоисключающие группы отображения, закрытые источники, ручной override, `STATUS_TRANSITIONS`, идемпотентность `applyDelta`, stale и пустой delta без роста версий, `resetSyncState`, миграция ролей и первый администратор, валидация mock PATCH, карантин `state.json`, эндпоинты `critical`/`reset`, каденция критических событий на 40 tick-ах, keyless-клиент vLLM, очистка Qwen thinking-блока, whitelist-валидация и исполнение фильтров, парсер ассистента и отказ от неизвестных полей, fallback-правила маршрутизации и валидация команды по `MTS_TEAMS`, нормализация истории и fallback постмортема, проверка fact/hypothesis-полей, deterministic quality rules/score, AI semantic merge/fallback, targeted notifications/SSE.
 
 ## Постоянное хранение и сброс
 
@@ -659,7 +748,7 @@ rm -f "$COOKIE_JAR"
 
 | Сервис | Контейнер / хост | Основные настройки |
 | --- | --- | --- |
-| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true`, `AI_BASE_URL=https://api.deepseek.com`, `AI_MODEL=deepseek-chat`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `PUBLIC_ORIGIN=`, `SESSION_TTL_MS=604800000` |
+| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true`, `AI_BASE_URL=https://api.deepseek.com`, `AI_MODEL=deepseek-chat`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `QUALITY_ENABLED=true`, `QUALITY_AI_ENABLED=true`, `QUALITY_AI_RATE_LIMIT_PER_MIN=5`, `QUALITY_AI_TIMEOUT_MS=20000`, `DEMO_MIN_INTERVAL_MS=3000`, `DEMO_MAX_INTERVAL_MS=9000`, `DEMO_BATCH_MIN=1`, `DEMO_BATCH_MAX=3`, `PUBLIC_ORIGIN=`, `SESSION_TTL_MS=604800000` |
 | `itsm-mock` | `3001 / 8081` | `DATA_DIR=/data`, пустое начальное состояние на новом volume |
 
 `app` и `itsm-mock` собираются из корневого build context; локальный vLLM поднимается отдельными `docker-compose.vllm*.yml` только в `--mode=vllm`. `app` стартует после успешного healthcheck mock через `depends_on` с `service_healthy`; недоступный AI-бэкенд не блокирует запуск и уходит в AI-fallback.

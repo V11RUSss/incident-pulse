@@ -9,6 +9,8 @@ const { AiClient, AiError } = require('./ai');
 const { askAssistant } = require('./assistant');
 const { suggestTeam } = require('./routing');
 const { generatePostmortem } = require('./postmortem');
+const { buildQualityReport, MAX_AI_CASE_IDS } = require('../lib/quality');
+const { scanQuality } = require('./quality');
 const { filterIncidents } = require('../lib/filters');
 const { ItsmClient, ItsmError } = require('./itsm');
 const { Store } = require('./store');
@@ -60,6 +62,17 @@ const port = configuredInteger(process.env.PORT, 3000, 0);
 const pollIntervalMs = configuredInteger(process.env.POLL_INTERVAL_MS, 2000);
 const itsmTimeoutMs = configuredInteger(process.env.ITSM_TIMEOUT_MS, 5000);
 const demoGeneration = process.env.DEMO_GENERATION === 'true';
+const demoMinIntervalMs = configuredInteger(process.env.DEMO_MIN_INTERVAL_MS, 3000, 1000);
+const demoMaxIntervalMs = Math.max(
+  demoMinIntervalMs,
+  configuredInteger(process.env.DEMO_MAX_INTERVAL_MS, 9000, 1000)
+);
+const demoBatchMin = configuredInteger(process.env.DEMO_BATCH_MIN, 1, 1);
+const demoBatchMax = Math.max(
+  demoBatchMin,
+  configuredInteger(process.env.DEMO_BATCH_MAX, 3, 1)
+);
+let demoNextAt = 0;
 const aiFallback = process.env.AI_FALLBACK !== 'false';
 const aiRateLimitPerMinute = configuredInteger(process.env.AI_RATE_LIMIT_PER_MIN, 10, 0);
 const assistantEnabled = process.env.ASSISTANT_ENABLED !== 'false';
@@ -70,6 +83,10 @@ const routingTimeoutMs = configuredInteger(process.env.ROUTING_TIMEOUT_MS, 20000
 const postmortemEnabled = process.env.POSTMORTEM_ENABLED !== 'false';
 const postmortemRateLimitPerMinute = configuredInteger(process.env.POSTMORTEM_RATE_LIMIT_PER_MIN, 10, 0);
 const postmortemTimeoutMs = configuredInteger(process.env.POSTMORTEM_TIMEOUT_MS, 60000, 1000);
+const qualityEnabled = process.env.QUALITY_ENABLED !== 'false';
+const qualityAiEnabled = process.env.QUALITY_AI_ENABLED !== 'false';
+const qualityRateLimitPerMinute = configuredInteger(process.env.QUALITY_AI_RATE_LIMIT_PER_MIN, 5, 0);
+const qualityTimeoutMs = configuredInteger(process.env.QUALITY_AI_TIMEOUT_MS, 20000, 1000);
 const publicOrigin = String(process.env.PUBLIC_ORIGIN || '').trim().replace(/\/+$/, '');
 const AI_RATE_WINDOW_MS = 60 * 1000;
 const ASSISTANT_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -89,6 +106,7 @@ const routingUsage = new Map();
 const routingCache = new Map();
 const postmortemUsage = new Map();
 const postmortemCache = new Map();
+const qualityUsage = new Map();
 const loginFailures = new Map();
 const store = new Store(DATA_DIR);
 const auth = new Auth(store);
@@ -281,6 +299,19 @@ function enforcePostmortemRateLimit(user) {
   postmortemUsage.set(user.id, timestamps);
 }
 
+function enforceQualityRateLimit(user) {
+  if (qualityRateLimitPerMinute === 0) return;
+  const now = Date.now();
+  const timestamps = (qualityUsage.get(user.id) || [])
+    .filter(timestamp => timestamp > now - AI_RATE_WINDOW_MS);
+  if (timestamps.length >= qualityRateLimitPerMinute) {
+    qualityUsage.set(user.id, timestamps);
+    throw new HttpError('Слишком много запросов сканирования качества; повторите позже', 429, 'rate_limited');
+  }
+  timestamps.push(now);
+  qualityUsage.set(user.id, timestamps);
+}
+
 function cachedAssistantResult(key) {
   const entry = assistantCache.get(key);
   if (!entry) return null;
@@ -363,7 +394,7 @@ function recordLoginFailure(key, now) {
   }
 }
 
-function openEvents(req, res) {
+function openEvents(req, res, userId = null) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -372,7 +403,7 @@ function openEvents(req, res) {
     'X-Content-Type-Options': 'nosniff'
   });
   res.write('retry: 3000\n: connected\n\n');
-  const client = { res, heartbeat: null };
+  const client = { res, heartbeat: null, userId: userId === null ? null : String(userId) };
   const cleanup = () => {
     if (!eventClients.has(client)) return;
     clearInterval(client.heartbeat);
@@ -411,6 +442,35 @@ function broadcastSync(payload) {
   for (const client of eventClients) writeEvent(client, 'sync', data);
 }
 
+function broadcastNotification(userId, notification, unread) {
+  if (!userId || !notification) return;
+  const targetUserId = String(userId);
+  const data = JSON.stringify({ type: 'notification.created', notification, unread });
+  for (const client of eventClients) {
+    if (client.userId === targetUserId) writeEvent(client, 'notification', data);
+  }
+}
+
+function notifyCoordinatorAssignment(incident, coordinator, actor) {
+  if (!incident || !coordinator || coordinator.id === actor.id) return null;
+  try {
+    const notification = store.createNotification({
+      userId: coordinator.id,
+      caseId: incident.caseId,
+      incidentId: incident.id,
+      type: 'coordinator_assigned',
+      title: 'Вам назначен инцидент',
+      message: `${incident.id} · ${incident.title}`
+    });
+    const unread = store.countUnreadNotifications(coordinator.id);
+    broadcastNotification(coordinator.id, notification, unread);
+    return notification;
+  } catch (error) {
+    console.error('Не удалось создать уведомление о назначении координатора', error);
+    return null;
+  }
+}
+
 async function loadDelta() {
   try {
     return { delta: await itsm.getChanges(store.getCurrentRevision()), reset: false };
@@ -422,10 +482,22 @@ async function loadDelta() {
   }
 }
 
+async function demoTickSafe() {
+  try {
+    return await itsm.demoTick();
+  } catch (error) {
+    console.warn(
+      'Демо-шаг mock пропущен:',
+      error instanceof ItsmError ? error.message : 'не удалось выполнить tick'
+    );
+    return null;
+  }
+}
+
 async function synchronize(source, generate = false) {
   const previousSyncError = store.getSyncState().syncError;
   try {
-    const demo = generate ? await itsm.demoTick() : null;
+    const demo = generate ? await demoTickSafe() : null;
     const { delta, reset } = await loadDelta();
     const changes = store.applyDelta(delta.incidents, delta.revision);
     if (reset) {
@@ -516,7 +588,9 @@ async function reassignCase(caseId, user, body) {
       action: 'reassign',
       details: { coordinatorId: coordinator.id, coordinatorName: coordinator.name }
     });
-    return { incident: requiredCase(caseId) };
+    const incident = requiredCase(caseId);
+    notifyCoordinatorAssignment(incident, coordinator, user);
+    return { incident };
   });
 }
 
@@ -820,6 +894,45 @@ async function postmortemGenerate(body) {
   return payload;
 }
 
+function qualityCaseIds(body) {
+  if (!Object.hasOwn(body, 'caseIds') || body.caseIds === undefined || body.caseIds === null) return null;
+  if (!Array.isArray(body.caseIds)) {
+    throw new HttpError('caseIds должен быть массивом caseId', 400, 'invalid_case_ids');
+  }
+  const unique = [];
+  const seen = new Set();
+  for (const value of body.caseIds) {
+    if (typeof value !== 'string' || !value.trim()) {
+      throw new HttpError('caseIds должен содержать непустые строки', 400, 'invalid_case_ids');
+    }
+    const caseId = value.trim();
+    if (caseId.length > 200) {
+      throw new HttpError('caseId должен содержать не более 200 символов', 400, 'invalid_case_ids');
+    }
+    if (!seen.has(caseId)) {
+      seen.add(caseId);
+      unique.push(caseId);
+    }
+  }
+  if (unique.length > MAX_AI_CASE_IDS) {
+    throw new HttpError('caseIds должен содержать не более ' + MAX_AI_CASE_IDS + ' значений', 400, 'invalid_case_ids');
+  }
+  return unique;
+}
+
+function qualityReport() {
+  return buildQualityReport(store.listCases());
+}
+
+async function qualityScan(body) {
+  const caseIds = qualityCaseIds(body);
+  return scanQuality(ai, store.listCases(), {
+    caseIds: caseIds || undefined,
+    aiEnabled: qualityAiEnabled,
+    timeoutMs: qualityTimeoutMs
+  });
+}
+
 async function routingSuggest(body) {
   if (!routingEnabled) {
     throw new HttpError('Маршрутизация отключена', 404, 'routing_disabled');
@@ -912,7 +1025,9 @@ function metaPayload() {
     teams: MTS_TEAMS,
     assistantEnabled,
     routingEnabled,
-    postmortemEnabled
+    postmortemEnabled,
+    qualityEnabled,
+    qualityAiEnabled
   };
 }
 
@@ -1126,8 +1241,36 @@ async function handleApi(req, res, pathname, search = '') {
     return;
   }
 
+  if (req.method === 'GET' && pathname === '/api/v1/notifications') {
+    const params = new URLSearchParams(search);
+    const rawLimit = params.get('limit');
+    let limit = 50;
+    if (rawLimit !== null) {
+      if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 200) {
+        throw new HttpError('limit должен быть целым числом от 1 до 200', 400);
+      }
+      limit = Number(rawLimit);
+    }
+    sendJson(res, 200, {
+      notifications: store.listNotifications(session.user.id, limit),
+      unread: store.countUnreadNotifications(session.user.id)
+    });
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/notifications/read-all') {
+    store.markAllNotificationsRead(session.user.id);
+    sendJson(res, 200, { ok: true, unread: store.countUnreadNotifications(session.user.id) });
+    return;
+  }
+  const notificationReadMatch = pathname.match(/^\/api\/v1\/notifications\/(\d+)\/read$/);
+  if (req.method === 'POST' && notificationReadMatch) {
+    const notification = store.markNotificationRead(Number(notificationReadMatch[1]), session.user.id);
+    if (!notification) throw new HttpError('Уведомление не найдено', 404);
+    sendJson(res, 200, { ok: true, unread: store.countUnreadNotifications(session.user.id) });
+    return;
+  }
   if (req.method === 'GET' && pathname === '/api/v1/events') {
-    openEvents(req, res);
+    openEvents(req, res, session.user.id);
     return;
   }
   if (req.method === 'GET' && pathname === '/api/v1/incidents') {
@@ -1164,6 +1307,17 @@ async function handleApi(req, res, pathname, search = '') {
   if (req.method === 'POST' && pathname === '/api/v1/postmortem') {
     enforcePostmortemRateLimit(session.user);
     sendJson(res, 200, await postmortemGenerate(await readObject(req)));
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/api/v1/quality') {
+    if (!qualityEnabled) throw new HttpError('Контроль качества отключён', 404, 'quality_disabled');
+    sendJson(res, 200, qualityReport());
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/quality/scan') {
+    if (!qualityEnabled) throw new HttpError('Контроль качества отключён', 404, 'quality_disabled');
+    enforceQualityRateLimit(session.user);
+    sendJson(res, 200, await qualityScan(await readOptionalObject(req)));
     return;
   }
 
@@ -1381,6 +1535,20 @@ async function main() {
   console.log(`Incident Pulse app listening on ${server.address().port}; ITSM mock: ${itsm.baseUrl}`);
   pollTimer = setInterval(() => {
     if (shuttingDown || pendingOperations > 0) return;
+    const now = Date.now();
+    if (demoGeneration && now >= demoNextAt) {
+      const delay = demoMinIntervalMs + Math.floor(Math.random() * (demoMaxIntervalMs - demoMinIntervalMs + 1));
+      const batch = demoBatchMin + Math.floor(Math.random() * (demoBatchMax - demoBatchMin + 1));
+      demoNextAt = now + delay;
+      enqueue(async () => {
+        for (let index = 0; index < batch; index += 1) {
+          const demo = await demoTickSafe();
+          if (!demo) break;
+        }
+        return synchronize('poll');
+      }).catch(() => {});
+      return;
+    }
     enqueue(() => synchronize('poll')).catch(() => {});
   }, pollIntervalMs);
   pollTimer.unref();

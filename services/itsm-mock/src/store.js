@@ -215,8 +215,16 @@ export class IncidentStore {
 
   tick() {
     return this.#enqueue(async () => {
+      const demoStep = this.#demoStep;
       const revision = this.#revision + 1;
-      const { added, record } = generateDemoIncident(this.#records, this.#demoStep);
+      const result = generateDemoIncident(this.#records, demoStep);
+      const record = result.record;
+      const existed = this.#records.has(record.id);
+      if (result.recovered) {
+        console.warn(
+          `itsm-mock: demo step ${demoStep} referenced missing incident ${record.id}; base record recreated`
+        );
+      }
       const records = new Map(this.#records);
       const revisions = new Map(this.#revisions);
       records.set(record.id, record);
@@ -225,14 +233,14 @@ export class IncidentStore {
         revision,
         records,
         revisions,
-        demoStep: this.#demoStep + 1,
+        demoStep: demoStep + 1,
       };
       await this.#persist(state);
       this.#apply(state);
       return {
         revision,
-        added: added ? 1 : 0,
-        updated: added ? 0 : 1,
+        added: existed ? 0 : 1,
+        updated: existed ? 1 : 0,
         incidents: [structuredClone(record)],
       };
     });

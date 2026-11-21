@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="dark light">
   <meta name="theme-color" content="#0a0d12" id="theme-color">
   <title>Инциденты в фокусе — Центр координации МТС</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%23E30613'/%3E%3Ctext x='16' y='21' font-family='Arial,sans-serif' font-size='11' font-weight='bold' fill='white' text-anchor='middle'%3EМТС%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'%3E%3Crect width='512' height='512' rx='120' fill='%23E30613'/%3E%3Cpath d='M70 280H150L196 172L260 358L312 244L344 280H382' fill='none' stroke='white' stroke-width='30' stroke-linecap='round' stroke-linejoin='round'/%3E%3Ccircle cx='436' cy='280' r='22' fill='white'/%3E%3C/svg%3E">
   <script src="theme.js"></script>
   <link rel="stylesheet" href="styles.css">
   <script src="app.js" defer></script>
@@ -16,17 +16,35 @@
 
   <header class="topbar">
     <div class="brand" aria-label="МТС Инциденты">
-      <span class="brand-logo" aria-hidden="true">МТС</span>
+      <svg class="brand-mark" viewBox="0 0 512 512" aria-hidden="true" focusable="false">
+        <rect class="brand-mark-bg" width="512" height="512" rx="120"></rect>
+        <path class="brand-mark-pulse" d="M70 280H150L196 172L260 358L312 244L344 280H382"></path>
+        <circle class="brand-mark-dot" cx="436" cy="280" r="22"></circle>
+      </svg>
       <span class="brand-copy">
         <strong>Инциденты</strong>
         <small>Дашборд координатора массовых инцидентов</small>
       </span>
     </div>
     <div class="topbar-right">
-      <span class="live-pill is-connecting" id="live-status" title="Автоматическое обновление данных">
+      <button class="live-pill is-connecting" id="live-status" type="button" aria-pressed="false" aria-label="Автообновление инцидентов" title="Автообновление включено. Нажмите, чтобы выключить.">
         <span class="live-dot" aria-hidden="true"></span>
         <span id="live-text">подключение…</span>
-      </span>
+      </button>
+      <div class="notification-bell" id="notification-bell-wrap">
+        <button class="icon-button notification-bell-button" id="notification-bell" type="button" aria-haspopup="true" aria-expanded="false" aria-controls="notification-panel" aria-label="Уведомления" title="Уведомления" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-bell"></use></svg>
+          <span class="notification-badge" id="notification-badge" hidden>0</span>
+        </button>
+        <div class="notification-panel" id="notification-panel" role="region" aria-label="Уведомления" hidden>
+          <header class="notification-header">
+            <strong>Уведомления</strong>
+            <button class="notification-read-all" id="notification-read-all" type="button" disabled>Прочитать все</button>
+          </header>
+          <ul class="notification-list" id="notification-list" role="list"></ul>
+          <p class="notification-empty" id="notification-empty">Уведомлений нет</p>
+        </div>
+      </div>
       <time class="clock" id="clock" aria-label="Текущее время, Москва"></time>
       <button class="icon-button" id="theme-toggle" type="button" aria-pressed="false" aria-label="Переключить на светлую тему" title="Светлая или тёмная тема">
         <svg class="icon" aria-hidden="true"><use href="#i-moon" id="theme-icon"></use></svg>
@@ -54,7 +72,11 @@
   <main class="auth-main" id="auth-view" hidden>
     <section class="auth-card" aria-labelledby="auth-title">
       <div class="auth-brand">
-        <span class="brand-logo" aria-hidden="true">МТС</span>
+        <svg class="brand-mark" viewBox="0 0 512 512" aria-hidden="true" focusable="false">
+        <rect class="brand-mark-bg" width="512" height="512" rx="120"></rect>
+        <path class="brand-mark-pulse" d="M70 280H150L196 172L260 358L312 244L344 280H382"></path>
+        <circle class="brand-mark-dot" cx="436" cy="280" r="22"></circle>
+      </svg>
         <div><p class="eyebrow">Центр координации</p><h1 id="auth-title">Доступ к инцидентам</h1></div>
       </div>
       <p class="auth-subtitle">Войдите или зарегистрируйте учётную запись координатора. Первый зарегистрированный пользователь становится администратором.</p>
@@ -153,6 +175,14 @@
         <svg class="icon" aria-hidden="true"><use href="#i-clock"></use></svg>
         Риск SLA <strong id="risk-count">0</strong>
       </span>
+      <button class="data-chip data-chip--action quality-chip" id="quality-chip" type="button" aria-controls="quality-panel" aria-expanded="false" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-shield"></use></svg>
+        Качество <strong id="quality-chip-count">0</strong>
+      </button>
+      <button class="data-chip data-chip--action" id="in-progress-jump" type="button" aria-controls="in-progress-view" hidden>
+        <svg class="icon" aria-hidden="true"><use href="#i-forward"></use></svg>
+        В работе <strong id="in-progress-chip-count">0</strong>
+      </button>
       <span class="data-chip">
         <svg class="icon" aria-hidden="true"><use href="#i-users"></use></svg>
         Затронуто <strong id="affected-count">0</strong> пользователей
@@ -217,9 +247,6 @@
         <span>Без команды</span>
         <span class="routing-queue-count" id="routing-queue-count">0</span>
       </button>
-      <button class="icon-button refresh-button" id="refresh-button" type="button" aria-label="Синхронизировать с ITSM">
-        <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
-      </button>
     </section>
 
     <p class="visually-hidden" id="results-status" aria-live="polite" aria-atomic="true"></p>
@@ -274,6 +301,18 @@
       </section>
     </div>
 
+    <section class="in-progress-view" id="in-progress-view" aria-labelledby="in-progress-title" hidden>
+      <header class="group-header in-progress-header">
+        <div class="group-heading-line">
+          <span class="group-marker group-in-progress" aria-hidden="true"></span>
+          <h2 id="in-progress-title">В работе</h2>
+          <span class="group-count" id="group-count-in-progress">0</span>
+        </div>
+        <p>Средний и низкий приоритет с назначенной командой</p>
+      </header>
+      <ul class="in-progress-list" id="list-in-progress" role="list"></ul>
+    </section>
+
     <section class="archive-view" id="archive-view" aria-labelledby="archive-title" hidden>
       <header class="archive-header">
         <div>
@@ -285,15 +324,10 @@
       <ul class="archive-list" id="list-archive" role="list"></ul>
     </section>
 
-    <section class="legend" aria-label="Легенда">
-      <span class="legend-title">Легенда</span>
-      <span class="legend-item"><i class="legend-dot legend-dot--critical"></i>Критические</span>
-      <span class="legend-item"><i class="legend-dot legend-dot--coordinator"></i>На координаторов</span>
-      <span class="legend-item"><i class="legend-dot legend-dot--high"></i>Высокий приоритет</span>
-      <span class="legend-item"><i class="legend-dot legend-dot--research"></i>Исследование</span>
-      <span class="legend-item"><i class="legend-dot legend-dot--active"></i>Активный</span>
-      <span class="legend-item"><i class="legend-dot legend-dot--resolved"></i>Решён</span>
-    </section>
+    <button class="in-progress-fab" id="in-progress-fab" type="button" aria-controls="in-progress-view" hidden>
+      <svg class="icon" aria-hidden="true"><use href="#i-forward"></use></svg>
+      В работе <strong id="in-progress-fab-count">0</strong>
+    </button>
   </main>
 
   <dialog class="incident-dialog" id="incident-dialog" aria-labelledby="dialog-title" closedby="any">
@@ -593,6 +627,64 @@
     <p class="routing-panel-hint">Подсказка не назначает команду. Нажмите «Назначить» или откройте инцидент.</p>
   </aside>
 
+  <aside class="quality-panel" id="quality-panel" aria-labelledby="quality-title" hidden>
+    <header class="quality-panel-header">
+      <div>
+        <p class="eyebrow">Качество данных</p>
+        <h2 id="quality-title" tabindex="-1">Качество инцидентов</h2>
+      </div>
+      <button class="icon-button" id="quality-close" type="button" aria-label="Закрыть панель качества">
+        <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
+      </button>
+    </header>
+    <div class="quality-panel-body">
+      <section class="quality-score-block" aria-label="Оценка качества">
+        <div class="quality-ring-wrap" id="quality-ring-wrap">
+          <svg class="quality-ring" viewBox="0 0 80 80" aria-hidden="true">
+            <circle class="quality-ring-track" cx="40" cy="40" r="34"></circle>
+            <circle class="quality-ring-value" id="quality-ring-value" cx="40" cy="40" r="34"></circle>
+          </svg>
+          <span class="quality-score-value" id="quality-score">—</span>
+        </div>
+        <div class="quality-score-copy">
+          <strong class="quality-status" id="quality-status">Нет данных</strong>
+          <p class="quality-verdict" id="quality-verdict">Отчёт о качестве ещё не загружен.</p>
+          <p class="quality-meta" id="quality-meta"></p>
+        </div>
+      </section>
+
+      <div class="quality-counts" aria-label="Проблемы по важности">
+        <span class="quality-count quality-count--high">Высокие <strong id="quality-count-high">0</strong></span>
+        <span class="quality-count quality-count--medium">Средние <strong id="quality-count-medium">0</strong></span>
+        <span class="quality-count quality-count--low">Низкие <strong id="quality-count-low">0</strong></span>
+        <span class="quality-source" id="quality-source">Правила</span>
+      </div>
+
+      <div class="quality-ai">
+        <button class="button button-secondary quality-ai-button" id="quality-ai-button" type="button" hidden>
+          <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
+          <span id="quality-ai-label">Проверить смысл</span>
+        </button>
+        <p class="quality-ai-status" id="quality-ai-status" aria-live="polite" hidden></p>
+        <p class="quality-generated" id="quality-generated"></p>
+      </div>
+
+      <p class="quality-truncated" id="quality-truncated" hidden>Показаны не все кейсы — выборка ограничена.</p>
+
+      <div class="quality-focus" id="quality-focus" hidden>
+        <span>Кейс: <strong id="quality-focus-case"></strong></span>
+        <button class="quality-focus-clear" id="quality-focus-clear" type="button">Показать все</button>
+      </div>
+
+      <div class="quality-filters" id="quality-filters" role="group" aria-label="Фильтр по типу проблемы"></div>
+
+      <ul class="quality-findings" id="quality-findings" role="list"></ul>
+      <p class="quality-empty" id="quality-empty" hidden>Проблем качества не найдено.</p>
+      <p class="quality-error" id="quality-error" role="alert" hidden></p>
+    </div>
+    <p class="quality-panel-hint">Проверка правил выполняется автоматически. «Проверить смысл» запускает ИИ-разбор и не изменяет инциденты.</p>
+  </aside>
+
   <div class="toast" id="toast" role="status" aria-label="Уведомления" hidden>
     <span class="toast-icon"><svg class="icon" aria-hidden="true"><use href="#i-check"></use></svg></span>
     <div><strong id="toast-title"></strong><span id="toast-message"></span></div>
@@ -620,6 +712,7 @@
     <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M14 6l6 6-6 6"/></symbol>
     <symbol id="i-external" viewBox="0 0 24 24"><path d="M14 4h6v6M20 4l-9 9"/><path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6"/></symbol>
     <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"/><path d="M18.5 9A7 7 0 0 0 6 6.5L4 9M5.5 15A7 7 0 0 0 18 17.5l2-2.5"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M6 9a6 6 0 0 1 12 0c0 4 1.5 5.5 2 6.5H4c.5-1 2-2.5 2-6.5Z"/><path d="M10 19a2 2 0 0 0 4 0"/></symbol>
     <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
     <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3 1.4 4.1L17.5 8.5l-4.1 1.4L12 14l-1.4-4.1-4.1-1.4 4.1-1.4L12 3Z"/><path d="m18.5 14 .8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8.8-2.2ZM5 14l.7 1.8 1.8.7-1.8.7L5 19l-.7-1.8-1.8-.7 1.8-.7L5 14Z"/></symbol>
     <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>

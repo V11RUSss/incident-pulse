@@ -1,4 +1,5 @@
 const SCENARIO_COUNT = 12;
+const CRITICAL_EVERY = 12;
 
 function automaticPriority(affectedUsers) {
   if (affectedUsers >= 1000) return 4;
@@ -83,10 +84,35 @@ function add(records, id, now, input) {
   return { added: true, record: createRecord(now, { ...input, id }) };
 }
 
+const RECOVERY_BASE_STEP_BY_ID = Object.freeze({
+  'MTS-MOBILE-0001': 0,
+  'MTS-MOBILE-0002': 2,
+  'MTS-ID-0001': 3,
+  'MTS-BANK-0001': 4,
+  'MTS-SMS-0001': 5,
+  'MTS-KION-0001': 6,
+  'MTS-CLOUD-0001': 7,
+});
+
+function recreateInitialRecord(id, now) {
+  const baseStep = RECOVERY_BASE_STEP_BY_ID[id];
+  if (baseStep === undefined) {
+    throw new Error(`Demo scenario is missing ${id}`);
+  }
+  // Base steps only create their record, so this replay never calls change() again.
+  return generateInitialIncident(new Map(), baseStep, now).record;
+}
+
 function change(records, id, now, changes) {
   const existing = records.get(id);
-  if (!existing) throw new Error(`Demo scenario is missing ${id}`);
-  return { added: false, record: updateRecord(existing, now, changes) };
+  const recovered = existing === undefined;
+  const target = existing ?? recreateInitialRecord(id, now);
+  const resolved = typeof changes === 'function' ? changes(target) : changes;
+  return {
+    added: recovered,
+    recovered,
+    record: updateRecord(target, now, resolved),
+  };
 }
 
 function generateInitialIncident(records, step, now) {
@@ -107,16 +133,13 @@ function generateInitialIncident(records, step, now) {
         isMaster: true,
         isEffect: true,
       });
-    case 1: {
-      const existing = records.get('MTS-MOBILE-0001');
-      if (!existing) throw new Error('Demo scenario is missing MTS-MOBILE-0001');
-      return change(records, existing.id, now, {
+    case 1:
+      return change(records, 'MTS-MOBILE-0001', now, (existing) => ({
         affectedUsers: Math.max(1000, existing.affectedUsers),
         reportCount: existing.reportCount + 5,
         description: 'Деградация распространилась на несколько коммутаторов. Зафиксирован массовый рост неуспешных вызовов, включён аварийный контур мониторинга.',
         deadline: new Date(Date.parse(now) + 5 * 60 * 1000).toISOString(),
-      });
-    }
+      }));
     case 2:
       return add(records, 'MTS-MOBILE-0002', now, {
         correlationKey: 'mobile-voice-moscow-outage',
@@ -199,36 +222,27 @@ function generateInitialIncident(records, step, now) {
         isEffect: true,
       });
     case 8:
-      return change(records, 'MTS-ID-0001', now, {
-        stateId: 2,
-        assignedGroupName: 'МТС ИТ Поддержка МТС ID',
-        reportCount: records.get('MTS-ID-0001').reportCount + 1,
-      });
+      return change(records, 'MTS-ID-0001', now, (existing) => ({
+        reportCount: existing.reportCount + 1,
+      }));
     case 9:
-      return change(records, 'MTS-BANK-0001', now, {
+      return change(records, 'MTS-BANK-0001', now, (existing) => ({
         stateId: 20,
-        assignedGroupName: 'МТС ИТ Поддержка МТС Банка',
         solution: 'Включён резервный контур подтверждения операций; первопричина деградации исследуется.',
-        reportCount: records.get('MTS-BANK-0001').reportCount + 1,
-      });
+        reportCount: existing.reportCount + 1,
+      }));
     case 10:
-      return change(records, 'MTS-KION-0001', now, {
+      return change(records, 'MTS-KION-0001', now, (existing) => ({
         stateId: 7,
-        assignedGroupName: 'МТС ИТ Поддержка KION',
         solution: 'Конфигурация CDN откачена на стабильную версию, воспроизведение видео восстановлено.',
         completionDate: now,
-        reportCount: records.get('MTS-KION-0001').reportCount + 1,
-      });
-    case 11: {
-      const existing = records.get('MTS-SMS-0001');
-      if (!existing) throw new Error('Demo scenario is missing MTS-SMS-0001');
-      return change(records, existing.id, now, {
-        stateId: 2,
-        assignedGroupName: 'МТС ИТ Поддержка SMS',
+        reportCount: existing.reportCount + 1,
+      }));
+    case 11:
+      return change(records, 'MTS-SMS-0001', now, (existing) => ({
         affectedUsers: Math.max(60, existing.affectedUsers + 5),
         reportCount: existing.reportCount + 2,
-      });
-    }
+      }));
     default:
       throw new Error('Unknown demo scenario');
   }
@@ -314,7 +328,7 @@ function criticalRecordId(demoStep) {
 }
 
 function generateCriticalIncident(records, demoStep, continuationIndex, now) {
-  const criticalIndex = Math.floor(continuationIndex / 3);
+  const criticalIndex = Math.floor(continuationIndex / CRITICAL_EVERY);
   if (criticalIndex % 2 === 1) {
     const candidates = [...records.values()]
       .filter((record) => (
@@ -355,7 +369,7 @@ function generateCriticalIncident(records, demoStep, continuationIndex, now) {
 
 function generateContinuationIncident(records, continuationIndex, now) {
   const demoStep = SCENARIO_COUNT + continuationIndex;
-  if (continuationIndex % 3 === 0) {
+  if (continuationIndex % CRITICAL_EVERY === 0) {
     return generateCriticalIncident(records, demoStep, continuationIndex, now);
   }
   const cycle = Math.floor(continuationIndex / CONTINUATION_STEP_COUNT);
@@ -409,6 +423,8 @@ function generateContinuationIncident(records, continuationIndex, now) {
     isNeedUp: product.isNeedUp,
   });
 }
+
+export { CRITICAL_EVERY };
 
 export function generateDemoIncident(records, demoStep, now = new Date().toISOString()) {
   if (demoStep < SCENARIO_COUNT) {

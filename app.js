@@ -3,6 +3,7 @@
 const MINUTE = 60_000;
 const SLA_RISK_WINDOW_MS = 15 * MINUTE;
 const THEME_KEY = 'incident-pulse-theme';
+const LIVE_KEY = 'incident-pulse-live';
 const TZ = 'Europe/Moscow';
 
 const FALLBACK_META = Object.freeze({
@@ -13,6 +14,8 @@ const FALLBACK_META = Object.freeze({
   assistantEnabled: true,
   routingEnabled: true,
   postmortemEnabled: true,
+  qualityEnabled: true,
+  qualityAiEnabled: true,
   teams: [
     'КЦ ИТ Координаторы Массовых Инцидентов',
     'МТС ИТ Поддержка Mobile voice',
@@ -75,10 +78,34 @@ const state = {
   bannerDismissed: false,
   syncing: false,
   live: false,
+  liveEnabled: readLivePreference(),
   suppressNotificationsUntil: 0,
   eventSource: null,
   toastTimer: null,
   announcementTimer: null,
+  notifications: {
+    items: [],
+    unread: 0,
+    open: false,
+    loaded: false,
+    loading: false
+  },
+  inProgress: {
+    observer: null,
+    inView: true
+  },
+  quality: {
+    report: null,
+    counts: new Map(),
+    loading: false,
+    scanning: false,
+    error: null,
+    aiError: null,
+    open: false,
+    filterType: 'all',
+    focusCaseId: null,
+    preserveAi: false
+  },
   admin: { users: [], audit: [], system: null, tab: 'users', confirmTimer: null },
   assistant: {
     open: false,
@@ -117,7 +144,6 @@ const elements = {
   product: document.querySelector('#product-filter'),
   risk: document.querySelector('#risk-filter'),
   reset: document.querySelector('#reset-filters'),
-  refresh: document.querySelector('#refresh-button'),
   syncButton: document.querySelector('#sync-button'),
   archiveButton: document.querySelector('#archive-button'),
   dialog: document.querySelector('#incident-dialog'),
@@ -164,7 +190,39 @@ const elements = {
   postmortemQuestions: document.querySelector('#postmortem-questions'),
   postmortemClose: document.querySelector('#postmortem-close'),
   postmortemCopy: document.querySelector('#postmortem-copy'),
-  postmortemDownload: document.querySelector('#postmortem-download')
+  postmortemDownload: document.querySelector('#postmortem-download'),
+  notificationBell: document.querySelector('#notification-bell'),
+  notificationBadge: document.querySelector('#notification-badge'),
+  notificationPanel: document.querySelector('#notification-panel'),
+  notificationList: document.querySelector('#notification-list'),
+  notificationEmpty: document.querySelector('#notification-empty'),
+  notificationReadAll: document.querySelector('#notification-read-all'),
+  qualityChip: document.querySelector('#quality-chip'),
+  qualityPanel: document.querySelector('#quality-panel'),
+  qualityTitle: document.querySelector('#quality-title'),
+  qualityClose: document.querySelector('#quality-close'),
+  qualityRingWrap: document.querySelector('#quality-ring-wrap'),
+  qualityRing: document.querySelector('#quality-ring-value'),
+  qualityScore: document.querySelector('#quality-score'),
+  qualityStatus: document.querySelector('#quality-status'),
+  qualityVerdict: document.querySelector('#quality-verdict'),
+  qualityMeta: document.querySelector('#quality-meta'),
+  qualityCountHigh: document.querySelector('#quality-count-high'),
+  qualityCountMedium: document.querySelector('#quality-count-medium'),
+  qualityCountLow: document.querySelector('#quality-count-low'),
+  qualitySource: document.querySelector('#quality-source'),
+  qualityAiButton: document.querySelector('#quality-ai-button'),
+  qualityAiLabel: document.querySelector('#quality-ai-label'),
+  qualityAiStatus: document.querySelector('#quality-ai-status'),
+  qualityGenerated: document.querySelector('#quality-generated'),
+  qualityTruncated: document.querySelector('#quality-truncated'),
+  qualityFocus: document.querySelector('#quality-focus'),
+  qualityFocusCase: document.querySelector('#quality-focus-case'),
+  qualityFocusClear: document.querySelector('#quality-focus-clear'),
+  qualityFilters: document.querySelector('#quality-filters'),
+  qualityFindings: document.querySelector('#quality-findings'),
+  qualityEmpty: document.querySelector('#quality-empty'),
+  qualityError: document.querySelector('#quality-error'),
 };
 
 /* ----------------------------------------------------------------- utils */
@@ -285,6 +343,19 @@ function toggleTheme() {
   applyTheme(currentTheme() === 'light' ? 'dark' : 'light');
 }
 
+function readLivePreference() {
+  try {
+    const stored = localStorage.getItem(LIVE_KEY);
+    return stored === null ? true : stored !== 'off';
+  } catch {
+    return true;
+  }
+}
+
+function persistLivePreference(enabled) {
+  try { localStorage.setItem(LIVE_KEY, enabled ? 'on' : 'off'); } catch { /* storage may be blocked */ }
+}
+
 function renderClock() {
   const clock = document.querySelector('#clock');
   if (!clock) return;
@@ -302,20 +373,44 @@ function renderLive() {
     return;
   }
   pill.hidden = false;
-  pill.classList.remove('is-live', 'is-stale', 'is-connecting');
-  if (state.live) {
+  pill.classList.remove('is-live', 'is-stale', 'is-connecting', 'is-off');
+  pill.setAttribute('aria-pressed', String(state.liveEnabled));
+  if (!state.liveEnabled) {
+    pill.classList.add('is-off');
+    text.textContent = 'live выкл';
+    pill.title = 'Автообновление выключено. Нажмите, чтобы включить.';
+    pill.setAttribute('aria-label', 'Включить автообновление инцидентов');
+  } else if (state.live) {
     pill.classList.add('is-live');
     text.textContent = 'live';
-    pill.title = 'Данные обновляются автоматически';
+    pill.title = 'Автообновление включено. Нажмите, чтобы выключить.';
+    pill.setAttribute('aria-label', 'Выключить автообновление инцидентов');
   } else if (state.eventSource) {
     pill.classList.add('is-stale');
-    text.textContent = 'нет связи';
+    text.textContent = 'Нет связи';
     pill.title = 'Соединение с сервером потеряно, выполняется переподключение';
+    pill.setAttribute('aria-label', 'Нет связи. Нажмите, чтобы выключить автообновление');
   } else {
     pill.classList.add('is-connecting');
     text.textContent = 'подключение…';
-    pill.title = 'Автоматическое обновление данных';
+    pill.title = 'Автообновление включено. Нажмите, чтобы выключить.';
+    pill.setAttribute('aria-label', 'Выключить автообновление инцидентов');
   }
+}
+
+function setLiveEnabled(enabled) {
+  const next = Boolean(enabled);
+  if (state.liveEnabled === next) return;
+  state.liveEnabled = next;
+  persistLivePreference(next);
+  if (next) connectEvents();
+  else closeEvents();
+  renderLive();
+}
+
+function toggleLive() {
+  setLiveEnabled(!state.liveEnabled);
+  announce(state.liveEnabled ? 'Автообновление включено.' : 'Автообновление выключено.');
 }
 
 /* -------------------------------------------------------------------- slа */
@@ -417,6 +512,8 @@ function showView(name) {
   document.querySelector('#auth-view').hidden = name !== 'auth';
   document.querySelector('#dashboard-view').hidden = name !== 'dashboard';
   renderLive();
+  renderNotifications();
+  renderQualityChip();
   syncAssistantVisibility();
   syncRoutingVisibility();
 }
@@ -429,8 +526,10 @@ function setUser(user) {
   if (!user) {
     block.hidden = true;
     if (adminButton) adminButton.hidden = true;
+    closeNotificationPanel();
     syncAssistantVisibility();
     syncRoutingVisibility();
+    renderNotifications();
     return;
   }
   block.hidden = false;
@@ -442,6 +541,7 @@ function setUser(user) {
   if (adminButton) adminButton.hidden = !isAdmin;
   syncAssistantVisibility();
   syncRoutingVisibility();
+  renderNotifications();
 }
 
 function handleUnauthorized() {
@@ -449,6 +549,7 @@ function handleUnauthorized() {
   resetAssistantUi();
   resetRoutingUi();
   resetPostmortem({ abort: true, clearHistory: true, clearCache: true });
+  resetQuality();
   setUser(null);
   state.incidents = [];
   state.counts = null;
@@ -470,7 +571,9 @@ async function loadMeta() {
         teams: data.teams.length ? data.teams : FALLBACK_META.teams,
         assistantEnabled: data.assistantEnabled !== false,
         routingEnabled: data.routingEnabled !== false,
-        postmortemEnabled: data.postmortemEnabled !== false
+        postmortemEnabled: data.postmortemEnabled !== false,
+        qualityEnabled: data.qualityEnabled !== false,
+        qualityAiEnabled: data.qualityAiEnabled !== false,
       };
     } else {
       state.meta = FALLBACK_META;
@@ -481,6 +584,7 @@ async function loadMeta() {
   syncAssistantVisibility();
   syncRoutingVisibility();
   updatePostmortemButton();
+  renderQualityChip();
 }
 
 async function loadCoordinators() {
@@ -502,6 +606,7 @@ async function refreshIncidents({ notify = false } = {}) {
   state.syncError = data.syncError ?? null;
   render();
   if (notify) detectChanges(previous, state.incidents);
+  queueQualityRefresh();
   return data;
 }
 
@@ -527,7 +632,9 @@ async function enterDashboard() {
   } catch (error) {
     if (error && error.status === 401) handleUnauthorized();
   }
-  connectEvents();
+  if (state.liveEnabled) connectEvents();
+  else closeEvents();
+  loadNotifications();
 }
 
 async function bootstrap() {
@@ -574,6 +681,18 @@ function connectEvents() {
       const notify = Date.now() >= state.suppressNotificationsUntil;
       queueRefresh({ notify });
     }
+  });
+  source.addEventListener('notification', event => {
+    let payload = null;
+    try {
+      payload = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (!payload || payload.type !== 'notification.created') return;
+    const notification = payload.notification;
+    if (!notification || notification.id === undefined || notification.id === null) return;
+    applyNotificationCreated(notification, payload.unread);
   });
 }
 
@@ -624,7 +743,772 @@ function detectChanges(previous, next) {
   }
 }
 
+/* ----------------------------------------------------------- notifications */
+
+function notificationUnread(value, fallback) {
+  const parsed = Number(value);
+  if (Number.isFinite(parsed) && parsed >= 0) return Math.floor(parsed);
+  return fallback;
+}
+
+function notificationTimestamp(value) {
+  if (value === null || value === undefined || value === '') return null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function notificationTime(value) {
+  const timestamp = notificationTimestamp(value);
+  return timestamp === null ? '' : formatRelative(timestamp);
+}
+
+function renderNotificationList() {
+  const list = elements.notificationList;
+  if (!list) return;
+  list.replaceChildren();
+  for (const notification of state.notifications.items) {
+    const item = document.createElement('li');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'notification-item' + (notification.readAt ? '' : ' is-unread');
+    button.dataset.notificationId = String(notification.id);
+    const title = document.createElement('strong');
+    title.textContent = notification.title || 'Уведомление';
+    button.append(title);
+    if (notification.message) {
+      const message = document.createElement('span');
+      message.textContent = notification.message;
+      button.append(message);
+    }
+    const time = document.createElement('time');
+    time.textContent = notificationTime(notification.createdAt);
+    const createdAt = notificationTimestamp(notification.createdAt);
+    if (createdAt !== null) time.dateTime = new Date(createdAt).toISOString();
+    button.append(time);
+    item.append(button);
+    list.append(item);
+  }
+  if (elements.notificationEmpty) elements.notificationEmpty.hidden = state.notifications.items.length > 0;
+}
+
+function renderNotifications() {
+  const bell = elements.notificationBell;
+  if (!bell) return;
+  const dashboardVisible = !document.querySelector('#dashboard-view').hidden;
+  const visible = Boolean(state.user) && dashboardVisible;
+  bell.hidden = !visible;
+  if (!visible && state.notifications.open) closeNotificationPanel();
+  const unread = notificationUnread(state.notifications.unread, 0);
+  if (elements.notificationBadge) {
+    elements.notificationBadge.hidden = unread === 0;
+    elements.notificationBadge.textContent = unread > 99 ? '99+' : String(unread);
+  }
+  bell.setAttribute('aria-label', unread ? `Уведомления: ${unread} новых` : 'Уведомления');
+  if (elements.notificationReadAll) elements.notificationReadAll.disabled = unread === 0;
+  renderNotificationList();
+}
+
+function openNotificationPanel() {
+  if (!elements.notificationPanel || !elements.notificationBell || elements.notificationBell.hidden) return;
+  if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+  state.notifications.open = true;
+  elements.notificationPanel.hidden = false;
+  elements.notificationBell.setAttribute('aria-expanded', 'true');
+  if (!state.notifications.loaded) loadNotifications();
+}
+
+function closeNotificationPanel() {
+  state.notifications.open = false;
+  if (elements.notificationPanel) elements.notificationPanel.hidden = true;
+  if (elements.notificationBell) elements.notificationBell.setAttribute('aria-expanded', 'false');
+}
+
+function toggleNotificationPanel() {
+  if (state.notifications.open) closeNotificationPanel();
+  else openNotificationPanel();
+}
+
+async function loadNotifications() {
+  if (!state.user || state.notifications.loading) return;
+  state.notifications.loading = true;
+  try {
+    const data = await api('/api/v1/notifications');
+    const items = Array.isArray(data.notifications) ? data.notifications : [];
+    state.notifications.items = items;
+    state.notifications.unread = notificationUnread(
+      data.unread,
+      items.filter(notification => !notification.readAt).length
+    );
+    state.notifications.loaded = true;
+  } catch (error) {
+    if (error.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+    // The notifications backend is optional: keep an empty, working bell on failure.
+  } finally {
+    state.notifications.loading = false;
+  }
+  renderNotifications();
+}
+
+function applyNotificationCreated(notification, unread) {
+  const items = state.notifications.items;
+  const exists = items.some(item => String(item.id) === String(notification.id));
+  if (!exists) items.unshift(notification);
+  if (items.length > 100) items.length = 100;
+  state.notifications.unread = notificationUnread(
+    unread,
+    notification.readAt ? state.notifications.unread : state.notifications.unread + 1
+  );
+  state.notifications.loaded = true;
+  renderNotifications();
+  showToast(notification.title || 'Новое уведомление', notification.message || 'Открыть список уведомлений', false);
+}
+
+function findIncidentForNotification(notification) {
+  const keys = [notification.caseId, notification.incidentId]
+    .filter(value => value !== undefined && value !== null)
+    .map(String);
+  if (!keys.length) return null;
+  return state.incidents.find(incident => keys.includes(String(incident.caseId)) || keys.includes(String(incident.id))) || null;
+}
+
+async function markNotificationRead(notification) {
+  let unread = state.notifications.unread;
+  try {
+    const data = await api(`/api/v1/notifications/${encodeURIComponent(String(notification.id))}/read`, { method: 'POST' });
+    unread = notificationUnread(data && data.unread, Math.max(0, state.notifications.unread - 1));
+  } catch (error) {
+    if (error.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+    unread = Math.max(0, state.notifications.unread - 1);
+  }
+  notification.readAt = notification.readAt || Date.now();
+  state.notifications.unread = unread;
+  renderNotifications();
+}
+
+async function markAllNotificationsRead() {
+  try {
+    await api('/api/v1/notifications/read-all', { method: 'POST' });
+  } catch (error) {
+    if (error.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+    showToast('Не удалось отметить уведомления', error.message, false);
+    return;
+  }
+  const readAt = Date.now();
+  for (const notification of state.notifications.items) {
+    if (!notification.readAt) notification.readAt = readAt;
+  }
+  state.notifications.unread = 0;
+  renderNotifications();
+}
+
+function resetNotifications() {
+  closeNotificationPanel();
+  state.notifications.items = [];
+  state.notifications.unread = 0;
+  state.notifications.loaded = false;
+  state.notifications.loading = false;
+  renderNotifications();
+}
+
+function onNotificationClick(event) {
+  const button = event.target.closest('[data-notification-id]');
+  if (!button) return;
+  const notification = state.notifications.items.find(item => String(item.id) === button.dataset.notificationId);
+  if (!notification) return;
+  closeNotificationPanel();
+  if (!notification.readAt) markNotificationRead(notification);
+  const incident = findIncidentForNotification(notification);
+  if (incident) openIncident(incident.caseId);
+  else if (notification.caseId || notification.incidentId) {
+    showToast('Инцидент недоступен', 'Он не найден в текущем списке', false);
+  }
+}
+
+/* --------------------------------------------------------------- quality */
+
+const QUALITY_TONE_LABELS = Object.freeze({ ok: 'В норме', warning: 'Требует внимания', critical: 'Критично' });
+const QUALITY_SEVERITY_LABELS = Object.freeze({ high: 'Высокий', medium: 'Средний', low: 'Низкий' });
+const QUALITY_TYPE_LABELS = Object.freeze({
+  team: 'Нет команды',
+  solution: 'Решение',
+  duplicate: 'Дубликат',
+  status: 'Статус',
+  field: 'Поля',
+  sla: 'SLA'
+});
+const QUALITY_RING_RADIUS = 34;
+const QUALITY_RING_LENGTH = 2 * Math.PI * QUALITY_RING_RADIUS;
+let qualityRequest = null;
+
+function qualityEnabled() {
+  return meta().qualityEnabled !== false;
+}
+
+function qualityAiEnabled() {
+  return qualityEnabled() && meta().qualityAiEnabled !== false;
+}
+
+function qualityNum(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function qualityScore(value) {
+  return Math.max(0, Math.min(100, Math.round(qualityNum(value))));
+}
+
+function qualitySeverity(value) {
+  const raw = String(value || '').toLowerCase();
+  if (['high', 'critical', 'crit', 'error', 'blocker'].includes(raw)) return 'high';
+  if (['medium', 'warning', 'warn', 'moderate', 'attention'].includes(raw)) return 'medium';
+  return 'low';
+}
+
+function qualitySeverityRank(severity) {
+  return severity === 'high' ? 3 : severity === 'medium' ? 2 : 1;
+}
+
+function qualityTone(report) {
+  if (!report) return 'ok';
+  const status = String(report.status || '').toLowerCase();
+  if (status) {
+    if (/crit|bad|poor|fail|error/.test(status)) return 'critical';
+    if (/warn|attention|risk|medium/.test(status)) return 'warning';
+    if (/^(ok|good|fine|pass|normal|clean)$/.test(status)) return 'ok';
+  }
+  const score = qualityNum(report.score);
+  if (score >= 85) return 'ok';
+  if (score >= 60) return 'warning';
+  return 'critical';
+}
+
+function qualityStatusLabel(report) {
+  const status = String((report && report.status) || '').toLowerCase();
+  if (/^(ok|good|fine|pass|normal|clean)$/.test(status)) return 'В норме';
+  if (/warn|attention|risk/.test(status)) return 'Требует внимания';
+  if (/crit|bad|poor|fail|error/.test(status)) return 'Критично';
+  return QUALITY_TONE_LABELS[qualityTone(report)];
+}
+
+function qualityVerdict(report) {
+  const total = qualityNum(report.total);
+  if (!total) return 'Проблем не найдено: данные выглядят согласованно.';
+  const parts = [];
+  const high = qualityNum(report.high);
+  const medium = qualityNum(report.medium);
+  const low = qualityNum(report.low);
+  if (high) parts.push(high + ' ' + plural(high, 'высокая', 'высокие', 'высоких'));
+  if (medium) parts.push(medium + ' ' + plural(medium, 'средняя', 'средние', 'средних'));
+  if (low) parts.push(low + ' ' + plural(low, 'низкая', 'низкие', 'низких'));
+  const suffix = plural(total, 'проблема', 'проблемы', 'проблем');
+  const lead = total === 1 ? 'Найдена ' + total + ' ' + suffix : 'Найдено ' + total + ' ' + suffix;
+  return lead + (parts.length ? ': ' + parts.join(', ') : '') + '.';
+}
+
+function qualityTypeLabel(report, type) {
+  const labels = (report && report.typeLabels) || {};
+  if (type && typeof labels[type] === 'string' && labels[type]) return labels[type];
+  if (type && QUALITY_TYPE_LABELS[type]) return QUALITY_TYPE_LABELS[type];
+  return type || 'Проверка';
+}
+
+function qualityFindingMatches(finding, caseId) {
+  if (!finding || !caseId) return false;
+  const key = String(caseId);
+  return String(finding.caseId ?? '') === key || String(finding.incidentId ?? '') === key;
+}
+
+function qualityScopedFindings() {
+  const report = state.quality.report;
+  if (!report) return [];
+  const focus = state.quality.focusCaseId;
+  if (!focus) return report.findings;
+  return report.findings.filter(finding => qualityFindingMatches(finding, focus));
+}
+
+function qualityVisibleFindings() {
+  const scoped = qualityScopedFindings();
+  const type = state.quality.filterType;
+  const filtered = type === 'all' ? scoped : scoped.filter(finding => finding.type === type);
+  return [...filtered].sort((a, b) => qualitySeverityRank(qualitySeverity(b.severity)) - qualitySeverityRank(qualitySeverity(a.severity)));
+}
+
+function buildQualityCounts(findings) {
+  const map = new Map();
+  const bump = (key, severity) => {
+    if (key === undefined || key === null || key === '') return;
+    const entry = map.get(String(key)) || { count: 0, tone: 'low' };
+    entry.count += 1;
+    if (qualitySeverityRank(severity) > qualitySeverityRank(entry.tone)) entry.tone = severity;
+    map.set(String(key), entry);
+  };
+  for (const finding of findings) {
+    const severity = qualitySeverity(finding.severity);
+    bump(finding.caseId, severity);
+    bump(finding.incidentId, severity);
+  }
+  return map;
+}
+
+function qualityForIncident(incident) {
+  if (!qualityEnabled() || !state.quality.report) return null;
+  const counts = state.quality.counts;
+  const entry = counts.get(String(incident.caseId)) || counts.get(String(incident.id));
+  return entry && entry.count > 0 ? entry : null;
+}
+
+function qualityBadgeFor(incident) {
+  const entry = qualityForIncident(incident);
+  if (!entry) return '';
+  const label = 'Проблемы качества: ' + entry.count + '. Открыть панель качества.';
+  return '<button class="quality-badge quality-badge--' + entry.tone + '" type="button" data-quality-case="'
+    + escapeHtml(incident.caseId) + '" aria-label="' + escapeHtml(label) + '" title="' + escapeHtml(label) + '">'
+    + icon('shield') + entry.count + '</button>';
+}
+
+function applyQualityReport(raw) {
+  if (!qualityEnabled()) return;
+  if (!raw || typeof raw !== 'object') return;
+  const findings = (Array.isArray(raw.findings) ? raw.findings : []).filter(item => item && typeof item === 'object');
+  const countSeverity = severity => findings.filter(finding => qualitySeverity(finding.severity) === severity).length;
+  const bySeverity = raw.bySeverity && typeof raw.bySeverity === 'object' && !Array.isArray(raw.bySeverity) ? raw.bySeverity : {};
+  const severityCount = (direct, severity) => {
+    if (direct !== undefined && direct !== null) return qualityNum(direct);
+    if (bySeverity[severity] !== undefined && bySeverity[severity] !== null) return qualityNum(bySeverity[severity]);
+    return countSeverity(severity);
+  };
+  const high = severityCount(raw.high, 'high');
+  const medium = severityCount(raw.medium, 'medium');
+  const low = severityCount(raw.low, 'low');
+  const report = {
+    score: qualityScore(raw.score),
+    status: typeof raw.status === 'string' ? raw.status : '',
+    total: raw.total !== undefined && raw.total !== null ? qualityNum(raw.total) : Math.max(high + medium + low, findings.length),
+    high,
+    medium,
+    low,
+    byType: raw.byType && typeof raw.byType === 'object' && !Array.isArray(raw.byType) ? raw.byType : {},
+    typeLabels: raw.typeLabels && typeof raw.typeLabels === 'object' && !Array.isArray(raw.typeLabels) ? raw.typeLabels : {},
+    scannedCases: qualityNum(raw.scannedCases),
+    truncated: Boolean(raw.truncated),
+    findings,
+    source: raw.source === 'rules+ai' ? 'rules+ai' : 'rules',
+    generatedAt: raw.generatedAt ?? null,
+    aiChecked: raw.aiChecked === undefined || raw.aiChecked === null ? null : qualityNum(raw.aiChecked),
+    aiSkipped: raw.aiSkipped === undefined || raw.aiSkipped === null ? null : raw.aiSkipped
+  };
+  state.quality.report = report;
+  state.quality.preserveAi = report.source === 'rules+ai';
+  state.quality.counts = buildQualityCounts(findings);
+  state.quality.error = null;
+  state.quality.aiError = null;
+  const activeTypes = new Set(findings.map(finding => finding.type).filter(Boolean));
+  for (const type of Object.keys(report.byType)) {
+    if (qualityNum(report.byType[type]) > 0) activeTypes.add(type);
+  }
+  if (state.quality.filterType !== 'all' && !activeTypes.has(state.quality.filterType)) state.quality.filterType = 'all';
+  const focus = state.quality.focusCaseId;
+  if (focus && !findings.some(finding => qualityFindingMatches(finding, focus))) state.quality.focusCaseId = null;
+}
+
+function qualityTypeCounts() {
+  const counts = new Map();
+  for (const finding of qualityScopedFindings()) {
+    if (!finding.type) continue;
+    counts.set(finding.type, (counts.get(finding.type) || 0) + 1);
+  }
+  return counts;
+}
+
+function qualityTypes(report) {
+  if (!report) return [];
+  const labels = report.typeLabels || {};
+  const byType = report.byType || {};
+  const counts = qualityTypeCounts();
+  const seen = new Set();
+  const list = [];
+  const add = type => {
+    if (!type || seen.has(type)) return;
+    seen.add(type);
+    const known = counts.get(type);
+    const fallback = state.quality.focusCaseId ? 0 : qualityNum(byType[type]);
+    list.push({ type, label: qualityTypeLabel(report, type), count: known === undefined ? fallback : known });
+  };
+  for (const type of Object.keys(labels)) add(type);
+  for (const type of Object.keys(byType)) add(type);
+  for (const finding of report.findings) add(finding.type);
+  return list;
+}
+
+function qualityFocusCaseLabel(caseId) {
+  const report = state.quality.report;
+  const finding = report ? report.findings.find(item => qualityFindingMatches(item, caseId)) : null;
+  if (finding && finding.incidentId) return String(finding.incidentId);
+  const incident = findIncident(String(caseId));
+  return incident ? incident.id : String(caseId);
+}
+
+function qualityEvidenceText(evidence) {
+  if (evidence === null || evidence === undefined) return '';
+  let text;
+  if (typeof evidence === 'string') text = evidence;
+  else {
+    try { text = JSON.stringify(evidence); } catch { text = String(evidence); }
+  }
+  text = String(text).trim();
+  if (text.length > 240) text = text.slice(0, 237) + '…';
+  return text;
+}
+
+function renderQualityChip() {
+  const chip = elements.qualityChip;
+  if (!chip) return;
+  const report = qualityEnabled() ? state.quality.report : null;
+  const visible = Boolean(report);
+  chip.hidden = !visible;
+  if (!visible) {
+    if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+    return;
+  }
+  const tone = qualityTone(report);
+  chip.classList.remove('quality-chip--ok', 'quality-chip--warning', 'quality-chip--critical');
+  chip.classList.add('quality-chip--' + tone);
+  const total = qualityNum(report.total);
+  const score = qualityNum(report.score);
+  setText('#quality-chip-count', score);
+  chip.title = 'Качество данных: ' + score + '/100 · проблем: ' + total + '. Открыть панель качества.';
+  chip.setAttribute('aria-label', chip.title);
+  chip.setAttribute('aria-expanded', String(state.quality.open));
+}
+
+function renderQualityFilters(report) {
+  const container = elements.qualityFilters;
+  if (!container) return;
+  container.replaceChildren();
+  if (!report) return;
+  const counts = qualityTypeCounts();
+  const makeButton = (value, label, count) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'quality-filter';
+    button.dataset.qualityType = value;
+    button.setAttribute('aria-pressed', String(state.quality.filterType === value));
+    button.textContent = label + (count ? ' · ' + count : '');
+    return button;
+  };
+  container.append(makeButton('all', 'Все', qualityScopedFindings().length));
+  for (const item of qualityTypes(report)) {
+    const count = counts.get(item.type) === undefined ? item.count : counts.get(item.type);
+    if (!count) continue;
+    container.append(makeButton(item.type, item.label, count));
+  }
+}
+
+function qualityFindingNode(finding) {
+  const severity = qualitySeverity(finding.severity);
+  const item = document.createElement('li');
+  item.className = 'quality-finding quality-finding--' + severity;
+  const head = document.createElement('div');
+  head.className = 'quality-finding-head';
+  const severityBadge = document.createElement('span');
+  severityBadge.className = 'quality-severity quality-severity--' + severity;
+  severityBadge.textContent = QUALITY_SEVERITY_LABELS[severity];
+  head.append(severityBadge);
+  const typeBadge = document.createElement('span');
+  typeBadge.className = 'quality-type';
+  typeBadge.textContent = qualityTypeLabel(state.quality.report, finding.type);
+  head.append(typeBadge);
+  const caseLabel = document.createElement('span');
+  caseLabel.className = 'quality-case';
+  caseLabel.textContent = String(finding.incidentId || finding.caseId || '');
+  head.append(caseLabel);
+  const openButton = document.createElement('button');
+  openButton.type = 'button';
+  openButton.className = 'quality-open';
+  openButton.textContent = 'Открыть';
+  openButton.dataset.qualityOpen = String(finding.caseId || finding.incidentId || '');
+  if (!finding.caseId && !finding.incidentId) openButton.disabled = true;
+  head.append(openButton);
+  item.append(head);
+  if (finding.title) {
+    const title = document.createElement('p');
+    title.className = 'quality-finding-title';
+    title.textContent = finding.title;
+    item.append(title);
+  }
+  if (finding.message) {
+    const message = document.createElement('p');
+    message.className = 'quality-finding-message';
+    message.textContent = finding.message;
+    item.append(message);
+  }
+  const evidence = qualityEvidenceText(finding.evidence);
+  if (evidence) {
+    const evidenceNode = document.createElement('p');
+    evidenceNode.className = 'quality-evidence';
+    evidenceNode.textContent = evidence;
+    item.append(evidenceNode);
+  }
+  if (finding.rule) {
+    const rule = document.createElement('span');
+    rule.className = 'quality-rule';
+    rule.textContent = 'Правило: ' + finding.rule;
+    item.append(rule);
+  }
+  if (finding.relatedCaseId || finding.relatedIncidentId) {
+    const related = document.createElement('button');
+    related.type = 'button';
+    related.className = 'quality-open quality-open--related';
+    related.textContent = 'Связанный ' + String(finding.relatedIncidentId || finding.relatedCaseId);
+    if (finding.relatedTitle) related.title = String(finding.relatedTitle);
+    related.dataset.qualityOpen = String(finding.relatedCaseId || finding.relatedIncidentId);
+    item.append(related);
+  }
+  return item;
+}
+
+function renderQualityFindings(report) {
+  const list = elements.qualityFindings;
+  if (!list) return;
+  list.replaceChildren();
+  const empty = elements.qualityEmpty;
+  if (!report) {
+    if (empty) empty.hidden = true;
+    return;
+  }
+  const visible = qualityVisibleFindings();
+  for (const finding of visible) list.append(qualityFindingNode(finding));
+  if (empty) {
+    empty.hidden = visible.length > 0;
+    empty.textContent = qualityNum(report.total) === 0
+      ? 'Проблем качества не найдено.'
+      : 'По выбранным условиям проблем нет.';
+  }
+}
+
+function qualityAiStatusText(report) {
+  if (state.quality.scanning) return 'ИИ разбирает формулировки…';
+  if (state.quality.aiError) return 'Ошибка ИИ: ' + state.quality.aiError;
+  if (!report) return '';
+  const checked = report.aiChecked;
+  const skipped = report.aiSkipped;
+  if (skipped === true) return 'ИИ-проверка недоступна: показан только детерминированный отчёт.';
+  if (checked === 0) return 'ИИ не нашёл кейсов для смысловой проверки.';
+  if (report.source !== 'rules+ai') return '';
+  let text = checked === null
+    ? 'ИИ-проверка выполнена.'
+    : 'ИИ проверил ' + checked + ' ' + plural(checked, 'кейс', 'кейса', 'кейсов') + '.';
+  if (typeof skipped === 'number' && skipped > 0) text += ' Пропущено: ' + skipped + '.';
+  return text;
+}
+
+function renderQualityPanel() {
+  const panel = elements.qualityPanel;
+  if (!panel) return;
+  if (!qualityEnabled()) {
+    if (state.quality.open) closeQualityPanel({ restoreFocus: false });
+    return;
+  }
+  if (panel.hidden) return;
+  const report = state.quality.report;
+  if (elements.qualityAiButton) {
+    elements.qualityAiButton.hidden = !qualityAiEnabled();
+    elements.qualityAiButton.disabled = state.quality.scanning || state.quality.loading;
+    elements.qualityAiButton.setAttribute('aria-busy', String(state.quality.scanning));
+  }
+  if (elements.qualityAiLabel) elements.qualityAiLabel.textContent = state.quality.scanning ? 'Проверяем…' : 'Проверить смысл';
+  if (elements.qualityScore) elements.qualityScore.textContent = report ? String(qualityNum(report.score)) : '—';
+  if (elements.qualityRing) {
+    const score = report ? qualityNum(report.score) : 0;
+    elements.qualityRing.setAttribute('stroke-dasharray', String(QUALITY_RING_LENGTH));
+    elements.qualityRing.setAttribute('stroke-dashoffset', String(QUALITY_RING_LENGTH * (1 - score / 100)));
+  }
+  if (elements.qualityRingWrap) {
+    elements.qualityRingWrap.classList.remove('is-ok', 'is-warning', 'is-critical');
+    elements.qualityRingWrap.classList.add('is-' + qualityTone(report));
+  }
+  if (elements.qualityStatus) {
+    elements.qualityStatus.textContent = report
+      ? qualityStatusLabel(report)
+      : state.quality.loading ? 'Проверяем…' : 'Нет данных';
+  }
+  if (elements.qualityVerdict) {
+    elements.qualityVerdict.textContent = report
+      ? qualityVerdict(report)
+      : 'Отчёт о качестве ещё не загружен.';
+  }
+  if (elements.qualityMeta) {
+    const scanned = report ? qualityNum(report.scannedCases) : 0;
+    const total = report ? qualityNum(report.total) : 0;
+    elements.qualityMeta.textContent = report
+      ? 'Проверено ' + scanned + ' ' + plural(scanned, 'кейс', 'кейса', 'кейсов') + ' · ' + total + ' ' + plural(total, 'проблема', 'проблемы', 'проблем')
+      : '';
+  }
+  if (elements.qualityCountHigh) elements.qualityCountHigh.textContent = String(report ? qualityNum(report.high) : 0);
+  if (elements.qualityCountMedium) elements.qualityCountMedium.textContent = String(report ? qualityNum(report.medium) : 0);
+  if (elements.qualityCountLow) elements.qualityCountLow.textContent = String(report ? qualityNum(report.low) : 0);
+  if (elements.qualitySource) {
+    elements.qualitySource.textContent = report && report.source === 'rules+ai' ? 'Правила + ИИ' : 'Правила';
+  }
+  if (elements.qualityGenerated) {
+    const timestamp = report ? notificationTimestamp(report.generatedAt) : null;
+    elements.qualityGenerated.textContent = timestamp === null ? '' : 'Обновлено ' + formatRelative(timestamp);
+  }
+  if (elements.qualityTruncated) elements.qualityTruncated.hidden = !(report && report.truncated);
+  if (elements.qualityAiStatus) {
+    const text = qualityAiStatusText(report);
+    elements.qualityAiStatus.hidden = !text;
+    elements.qualityAiStatus.textContent = text;
+    elements.qualityAiStatus.classList.toggle('is-error', Boolean(state.quality.aiError) && !state.quality.scanning);
+  }
+  if (elements.qualityError) {
+    const error = state.quality.loading ? '' : (state.quality.error || '');
+    elements.qualityError.hidden = !error;
+    elements.qualityError.textContent = error ? 'Не удалось загрузить отчёт: ' + error : '';
+  }
+  const focus = state.quality.focusCaseId;
+  if (elements.qualityFocus) elements.qualityFocus.hidden = !focus;
+  if (focus && elements.qualityFocusCase) elements.qualityFocusCase.textContent = qualityFocusCaseLabel(focus);
+  renderQualityFilters(report);
+  renderQualityFindings(report);
+}
+
+function openQualityPanel(options = {}) {
+  if (!qualityEnabled() || !state.quality.report) return;
+  const caseId = options && options.caseId ? String(options.caseId) : null;
+  if (state.assistant.open) closeAssistant();
+  if (state.routing.queueOpen) closeRoutingPanel();
+  closeNotificationPanel();
+  if (caseId) {
+    state.quality.focusCaseId = caseId;
+    state.quality.filterType = 'all';
+  }
+  state.quality.open = true;
+  if (elements.qualityPanel) elements.qualityPanel.hidden = false;
+  if (elements.qualityChip) elements.qualityChip.setAttribute('aria-expanded', 'true');
+  renderQualityPanel();
+  if (elements.qualityTitle) elements.qualityTitle.focus({ preventScroll: true });
+}
+
+function closeQualityPanel(options = {}) {
+  const wasOpen = state.quality.open;
+  state.quality.open = false;
+  if (elements.qualityPanel) elements.qualityPanel.hidden = true;
+  if (elements.qualityChip) elements.qualityChip.setAttribute('aria-expanded', 'false');
+  if (wasOpen && options.restoreFocus !== false && elements.qualityChip && !elements.qualityChip.hidden) {
+    elements.qualityChip.focus({ preventScroll: true });
+  }
+}
+
+function toggleQualityPanel() {
+  if (state.quality.open) closeQualityPanel();
+  else openQualityPanel();
+}
+
+function queueQualityRefresh() {
+  if (!qualityEnabled()) return Promise.resolve(null);
+  if (state.quality.preserveAi) return Promise.resolve(state.quality.report);
+  if (qualityRequest) return qualityRequest;
+  qualityRequest = (async () => {
+    state.quality.loading = true;
+    renderQualityPanel();
+    try {
+      const report = await api('/api/v1/quality');
+      if (!state.user) return null;
+      applyQualityReport(report);
+      render();
+      renderQualityPanel();
+      return state.quality.report;
+    } catch (error) {
+      if (error.status === 401) {
+        handleUnauthorized();
+        return null;
+      }
+      state.quality.error = error.message;
+      renderQualityPanel();
+      return null;
+    } finally {
+      state.quality.loading = false;
+      qualityRequest = null;
+      renderQualityChip();
+      renderQualityPanel();
+    }
+  })();
+  return qualityRequest;
+}
+
+async function scanQualitySemantics() {
+  if (!qualityAiEnabled() || state.quality.scanning) return;
+  state.quality.scanning = true;
+  state.quality.aiError = null;
+  renderQualityPanel();
+  try {
+    const report = await api('/api/v1/quality/scan', { method: 'POST', body: {} });
+    applyQualityReport(report);
+    render();
+    renderQualityPanel();
+    const total = state.quality.report ? qualityNum(state.quality.report.total) : 0;
+    showToast('Качество проверено', 'Найдено ' + total + ' ' + plural(total, 'проблема', 'проблемы', 'проблем'), false);
+  } catch (error) {
+    if (error.status === 401) handleUnauthorized();
+    else state.quality.aiError = error.message;
+  } finally {
+    state.quality.scanning = false;
+    renderQualityPanel();
+  }
+}
+
+function openQualityCase(caseId) {
+  if (caseId === undefined || caseId === null || caseId === '') return;
+  const key = String(caseId);
+  const incident = state.incidents.find(item => String(item.caseId) === key || String(item.id) === key);
+  if (!incident) {
+    showToast('Инцидент недоступен', 'Кейс не найден в текущем списке', false);
+    return;
+  }
+  closeQualityPanel({ restoreFocus: false });
+  openIncident(incident.caseId);
+}
+
+function onQualityFindingsClick(event) {
+  const button = event.target.closest('[data-quality-open]');
+  if (!button) return;
+  openQualityCase(button.dataset.qualityOpen);
+}
+
+function onQualityFilterClick(event) {
+  const button = event.target.closest('[data-quality-type]');
+  if (!button) return;
+  state.quality.filterType = button.dataset.qualityType || 'all';
+  renderQualityPanel();
+}
+
+function resetQuality() {
+  closeQualityPanel({ restoreFocus: false });
+  state.quality.report = null;
+  state.quality.counts = new Map();
+  state.quality.loading = false;
+  state.quality.scanning = false;
+  state.quality.error = null;
+  state.quality.aiError = null;
+  state.quality.filterType = 'all';
+  state.quality.focusCaseId = null;
+  state.quality.preserveAi = false;
+  renderQualityChip();
+}
+
 /* --------------------------------------------------------------- rendering */
+
 
 function priorityBadge(incident) {
   const manual = incident.prioritySource === 'manual';
@@ -642,13 +1526,9 @@ function renderCard(incident, group) {
   const sla = getSla(incident);
   const progress = slaProgress(incident);
   const caseId = escapeHtml(incident.caseId);
-  const sourceCount = (incident.sourceIds || []).length;
   const flags = [];
 
-  if (incident.isNeedUp) flags.push(`<span class="flag flag--needup">Эскалация</span>`);
-  if (incident.isMaster) flags.push(`<span class="flag flag--master">Мастер</span>`);
-  if (incident.isEffect) flags.push(`<span class="flag flag--effect">Влияние</span>`);
-  if (sourceCount > 1) flags.push(`<span class="flag flag--source">${sourceCount} ${plural(sourceCount, 'источник', 'источника', 'источников')}</span>`);
+  if (incident.isNeedUp) flags.push('<span class="flag flag--needup">Эскалация</span>');
 
   const cardGroup = group === 'archive' ? 'archive' : group || 'active';
   const coordinator = incident.coordinatorName || 'Не назначен';
@@ -659,7 +1539,10 @@ function renderCard(incident, group) {
   return `<li>
     <article class="incident-card card-${cardGroup}">
       <div class="card-topline">
-        ${priorityBadge(incident)}
+        <div class="card-topline-main">
+          ${priorityBadge(incident)}
+          ${qualityBadgeFor(incident)}
+        </div>
         <a class="card-itsm" href="${itsmUrl(incident)}" target="_blank" rel="noopener noreferrer" aria-label="Открыть ${escapeHtml(incident.id)} в ITSM">${icon('external')}</a>
       </div>
       <p class="card-product">${escapeHtml(incident.product || 'ITSM')}<span class="card-service">${incident.service ? ' · ' + escapeHtml(incident.service) : ''}</span></p>
@@ -714,6 +1597,12 @@ function getFilteredIncidents(list, { applyRisk = false } = {}) {
   });
 }
 
+function isInProgress(incident) {
+  return incident.groups.includes('active')
+    && Boolean(incident.team)
+    && !incident.groups.some(group => ['critical', 'high', 'coordination', 'research'].includes(group));
+}
+
 function renderGroups() {
   const live = state.incidents.filter(incident => !incident.groups.includes('closed'));
   const filtered = getFilteredIncidents(live, { applyRisk: true });
@@ -725,12 +1614,80 @@ function renderGroups() {
       : '<li class="empty-state">Нет инцидентов по выбранным условиям</li>';
     setText(`#group-count-${group}`, items.length);
   }
+
+  const inProgress = filtered.filter(isInProgress).sort(compareIncidents);
+  const inProgressList = document.querySelector('#list-in-progress');
+  const inProgressView = document.querySelector('#in-progress-view');
+  if (inProgressList) {
+    inProgressList.innerHTML = inProgress
+      .map(incident => renderCard(incident, 'in-progress'))
+      .join('');
+  }
+  setText('#group-count-in-progress', inProgress.length);
+  setText('#in-progress-chip-count', inProgress.length);
+  setText('#in-progress-fab-count', inProgress.length);
+  const inProgressJump = document.querySelector('#in-progress-jump');
+  if (inProgressJump) inProgressJump.hidden = state.filters.archive || !inProgress.length;
+  if (inProgressView) inProgressView.hidden = state.filters.archive || !inProgress.length;
+  observeInProgressView();
+  updateInProgressFab();
+}
+
+function updateInProgressFab() {
+  const fab = document.querySelector('#in-progress-fab');
+  if (!fab) return;
+  const view = document.querySelector('#in-progress-view');
+  if (view && !state.inProgress.observer) state.inProgress.inView = isInProgressViewVisible(view);
+  const dashboardVisible = !document.querySelector('#dashboard-view').hidden;
+  const exists = Boolean(view) && !view.hidden && !state.filters.archive;
+  const visible = Boolean(state.user) && dashboardVisible && exists && !state.inProgress.inView;
+  fab.hidden = !visible;
+}
+
+function isInProgressViewVisible(view) {
+  if (!view || view.hidden) return false;
+  const rect = view.getBoundingClientRect();
+  return rect.bottom > 0 && rect.top < window.innerHeight;
+}
+
+function observeInProgressView() {
+  const view = document.querySelector('#in-progress-view');
+  const observer = state.inProgress.observer;
+  if (!view || !observer) return;
+  state.inProgress.inView = isInProgressViewVisible(view);
+  observer.unobserve(view);
+  observer.observe(view);
+}
+
+function setupInProgressObserver() {
+  const view = document.querySelector('#in-progress-view');
+  if (!view || typeof IntersectionObserver !== 'function') return;
+  const observer = new IntersectionObserver(entries => {
+    const entry = entries[entries.length - 1];
+    if (!entry) return;
+    state.inProgress.inView = entry.isIntersecting;
+    updateInProgressFab();
+  }, { threshold: 0 });
+  state.inProgress.observer = observer;
+  observer.observe(view);
+}
+
+function jumpToInProgress() {
+  const view = document.querySelector('#in-progress-view');
+  if (!view || view.hidden) return;
+  view.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  const count = document.querySelector('#group-count-in-progress');
+  announce('В работе: ' + (count ? count.textContent : '0') + ' инцидентов.');
 }
 
 function renderArchive() {
   const archiveMode = state.filters.archive;
   document.querySelector('#groups-grid').hidden = archiveMode;
   document.querySelector('#archive-view').hidden = !archiveMode;
+  if (archiveMode) {
+    const inProgressView = document.querySelector('#in-progress-view');
+    if (inProgressView) inProgressView.hidden = true;
+  }
   elements.archiveButton.setAttribute('aria-pressed', String(archiveMode));
   if (!archiveMode) return;
   const closed = state.incidents.filter(incident => incident.groups.includes('closed'));
@@ -886,6 +1843,7 @@ function render() {
   renderToolbarState();
   renderSyncState();
   renderLive();
+  renderQualityChip();
   renderAssistantChip();
   renderRoutingQueueButton();
   if (state.activeId && findIncident(state.activeId)) {
@@ -972,6 +1930,7 @@ function syncAssistantVisibility() {
 function openAssistant() {
   if (!elements.assistantButton || elements.assistantButton.hidden) return;
   if (state.routing.queueOpen) closeRoutingPanel();
+  if (state.quality.open) closeQualityPanel({ restoreFocus: false });
   state.assistant.open = true;
   elements.assistantPanel.hidden = false;
   elements.assistantButton.setAttribute('aria-expanded', 'true');
@@ -1311,6 +2270,7 @@ function focusTeamSelect() {
 function openRoutingPanel() {
   if (!elements.routingPanel || meta().routingEnabled === false || !state.user) return;
   if (state.assistant.open) closeAssistant();
+  if (state.quality.open) closeQualityPanel({ restoreFocus: false });
   state.routing.queueOpen = true;
   elements.routingPanel.hidden = false;
   elements.routingQueueButton.setAttribute('aria-expanded', 'true');
@@ -2332,22 +3292,25 @@ async function performAction(incident, action, body, method = 'POST') {
   const payload = method === 'DELETE' ? undefined : { ...(body || {}), expectedVersion: incident.version };
   setDialogBusy(true);
   clearDialogMessages();
+  let success = false;
   try {
     noteLocalChange();
     await api(path, { method, body: payload });
     await queueRefresh({ notify: false });
     showDialogSuccess(action);
     await loadHistory(incident.caseId);
+    success = true;
   } catch (error) {
     if (error.status === 401) {
       handleUnauthorized();
-      return;
+    } else {
+      showDialogError(error);
+      if (error.status === 409 || error.status === 400) await queueRefresh({ notify: false });
     }
-    showDialogError(error);
-    if (error.status === 409 || error.status === 400) await queueRefresh({ notify: false });
   } finally {
     setDialogBusy(false);
   }
+  return success;
 }
 
 async function submitReassign(event) {
@@ -2363,7 +3326,10 @@ async function submitPriority(event) {
   event.preventDefault();
   const incident = currentIncident();
   if (!incident) return;
-  await performAction(incident, 'priority', { priorityId: Number(document.querySelector('#priority-select').value) });
+  const success = await performAction(incident, 'priority', { priorityId: Number(document.querySelector('#priority-select').value) });
+  if (!success) return;
+  elements.dialog.close();
+  showToast('Приоритет сохранён', incident.id);
 }
 
 async function submitDeadline(event) {
@@ -2381,7 +3347,10 @@ async function submitTeam(event) {
   if (!incident) return;
   const team = document.querySelector('#team-select').value;
   if (!team) return;
-  await performAction(incident, 'team', { team });
+  const success = await performAction(incident, 'team', { team });
+  if (!success) return;
+  elements.dialog.close();
+  showToast('Команда назначена', incident.id);
 }
 
 async function submitStatus(event) {
@@ -2408,9 +3377,7 @@ async function clearPriorityOverride() {
 function setSyncing(value) {
   state.syncing = value;
   elements.syncButton.disabled = value;
-  elements.refresh.disabled = value;
   elements.syncButton.classList.toggle('is-refreshing', value);
-  elements.refresh.classList.toggle('is-refreshing', value);
   renderSyncState();
 }
 
@@ -2755,6 +3722,8 @@ async function logout() {
   }
   closeEvents();
   setUser(null);
+  resetNotifications();
+  resetQuality();
   state.incidents = [];
   state.counts = null;
   state.lastSyncedAt = null;
@@ -2844,9 +3813,29 @@ function bindEvents() {
     announce(state.filters.archive ? 'Показан архив завершённых инцидентов.' : 'Показан живой список инцидентов.');
   });
   elements.syncButton.addEventListener('click', syncNow);
-  elements.refresh.addEventListener('click', syncNow);
+  document.querySelector('#live-status').addEventListener('click', toggleLive);
+
+  elements.notificationBell.addEventListener('click', toggleNotificationPanel);
+  elements.notificationReadAll.addEventListener('click', markAllNotificationsRead);
+  elements.notificationList.addEventListener('click', onNotificationClick);
+
+  elements.qualityChip.addEventListener('click', toggleQualityPanel);
+  elements.qualityClose.addEventListener('click', () => closeQualityPanel());
+  elements.qualityAiButton.addEventListener('click', scanQualitySemantics);
+  elements.qualityFilters.addEventListener('click', onQualityFilterClick);
+  elements.qualityFindings.addEventListener('click', onQualityFindingsClick);
+  elements.qualityFocusClear.addEventListener('click', () => {
+    state.quality.focusCaseId = null;
+    renderQualityPanel();
+  });
 
   document.addEventListener('click', event => {
+    if (state.notifications.open && !event.target.closest('#notification-bell-wrap')) closeNotificationPanel();
+    const qualityTrigger = event.target.closest('[data-quality-case]');
+    if (qualityTrigger) {
+      openQualityPanel({ caseId: qualityTrigger.dataset.qualityCase });
+      return;
+    }
     const trigger = event.target.closest('[data-open-incident]');
     if (trigger) openIncident(trigger.dataset.openIncident);
   });
@@ -2912,6 +3901,13 @@ function bindEvents() {
     closeRoutingPanel();
     elements.routingQueueButton.focus();
   });
+  document.querySelector('#in-progress-jump').addEventListener('click', jumpToInProgress);
+  document.querySelector('#in-progress-fab').addEventListener('click', jumpToInProgress);
+  setupInProgressObserver();
+  if (!state.inProgress.observer) {
+    window.addEventListener('scroll', updateInProgressFab, { passive: true });
+    window.addEventListener('resize', updateInProgressFab);
+  }
   elements.postmortemButton.addEventListener('click', requestPostmortem);
   elements.postmortemClose.addEventListener('click', closePostmortem);
   elements.postmortemCopy.addEventListener('click', copyPostmortem);
@@ -2921,6 +3917,15 @@ function bindEvents() {
       if (elements.dialog.open || (elements.adminDialog && elements.adminDialog.open)) return;
       event.preventDefault();
       openAssistant();
+      return;
+    }
+    if (event.key === 'Escape' && state.quality.open && !elements.dialog.open) {
+      closeQualityPanel();
+      return;
+    }
+    if (event.key === 'Escape' && state.notifications.open) {
+      closeNotificationPanel();
+      elements.notificationBell.focus();
       return;
     }
     if (event.key === 'Escape' && state.routing.queueOpen && !elements.dialog.open && !(elements.adminDialog && elements.adminDialog.open)) {
