@@ -8,6 +8,7 @@ const { Auth, AuthError } = require('./auth');
 const { AiClient, AiError } = require('./ai');
 const { askAssistant } = require('./assistant');
 const { suggestTeam } = require('./routing');
+const { generatePostmortem } = require('./postmortem');
 const { filterIncidents } = require('../lib/filters');
 const { ItsmClient, ItsmError } = require('./itsm');
 const { Store } = require('./store');
@@ -66,6 +67,9 @@ const assistantRateLimitPerMinute = configuredInteger(process.env.ASSISTANT_RATE
 const routingEnabled = process.env.ROUTING_ENABLED !== 'false';
 const routingRateLimitPerMinute = configuredInteger(process.env.ROUTING_RATE_LIMIT_PER_MIN, 30, 0);
 const routingTimeoutMs = configuredInteger(process.env.ROUTING_TIMEOUT_MS, 20000, 1000);
+const postmortemEnabled = process.env.POSTMORTEM_ENABLED !== 'false';
+const postmortemRateLimitPerMinute = configuredInteger(process.env.POSTMORTEM_RATE_LIMIT_PER_MIN, 10, 0);
+const postmortemTimeoutMs = configuredInteger(process.env.POSTMORTEM_TIMEOUT_MS, 60000, 1000);
 const publicOrigin = String(process.env.PUBLIC_ORIGIN || '').trim().replace(/\/+$/, '');
 const AI_RATE_WINDOW_MS = 60 * 1000;
 const ASSISTANT_CACHE_TTL_MS = 10 * 60 * 1000;
@@ -73,6 +77,8 @@ const ASSISTANT_CACHE_MAX = 200;
 const ASSISTANT_TEXT_MAX = 400;
 const ROUTING_CACHE_TTL_MS = 10 * 60 * 1000;
 const ROUTING_CACHE_MAX = 500;
+const POSTMORTEM_CACHE_TTL_MS = 10 * 60 * 1000;
+const POSTMORTEM_CACHE_MAX = 300;
 const LOGIN_FAILURE_LIMIT = 10;
 const LOGIN_FAILURE_WINDOW_MS = 5 * 60 * 1000;
 const LOGIN_FAILURE_KEYS_LIMIT = 5000;
@@ -81,6 +87,8 @@ const assistantUsage = new Map();
 const assistantCache = new Map();
 const routingUsage = new Map();
 const routingCache = new Map();
+const postmortemUsage = new Map();
+const postmortemCache = new Map();
 const loginFailures = new Map();
 const store = new Store(DATA_DIR);
 const auth = new Auth(store);
@@ -260,6 +268,19 @@ function enforceRoutingRateLimit(user) {
   routingUsage.set(user.id, timestamps);
 }
 
+function enforcePostmortemRateLimit(user) {
+  if (postmortemRateLimitPerMinute === 0) return;
+  const now = Date.now();
+  const timestamps = (postmortemUsage.get(user.id) || [])
+    .filter(timestamp => timestamp > now - AI_RATE_WINDOW_MS);
+  if (timestamps.length >= postmortemRateLimitPerMinute) {
+    postmortemUsage.set(user.id, timestamps);
+    throw new HttpError('Слишком много запросов постмортема; повторите позже', 429, 'rate_limited');
+  }
+  timestamps.push(now);
+  postmortemUsage.set(user.id, timestamps);
+}
+
 function cachedAssistantResult(key) {
   const entry = assistantCache.get(key);
   if (!entry) return null;
@@ -294,6 +315,24 @@ function rememberRoutingResult(key, result) {
     if (oldest !== undefined) routingCache.delete(oldest);
   }
   routingCache.set(key, { result, expiresAt: Date.now() + ROUTING_CACHE_TTL_MS });
+}
+
+function cachedPostmortem(key) {
+  const entry = postmortemCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    postmortemCache.delete(key);
+    return null;
+  }
+  return entry.result;
+}
+
+function rememberPostmortem(key, result) {
+  if (postmortemCache.size >= POSTMORTEM_CACHE_MAX) {
+    const oldest = postmortemCache.keys().next().value;
+    if (oldest !== undefined) postmortemCache.delete(oldest);
+  }
+  postmortemCache.set(key, { result, expiresAt: Date.now() + POSTMORTEM_CACHE_TTL_MS });
 }
 
 function loginThrottleKey(req, body) {
@@ -764,6 +803,23 @@ function fallbackIncidentSummary(incident) {
   return { summary, attentions, recommendation };
 }
 
+async function postmortemGenerate(body) {
+  if (!postmortemEnabled) {
+    throw new HttpError('Постмортем отключён', 404, 'postmortem_disabled');
+  }
+  const caseId = nullableText(body.caseId);
+  if (!caseId) throw new HttpError('caseId обязателен', 400, 'invalid_case');
+  const incident = requiredCase(caseId);
+  const history = store.listHistory(caseId);
+  const signature = caseId + ':' + incident.version + ':' + history.length + ':' + (history[0] ? history[0].id : 0);
+  const cached = cachedPostmortem(signature);
+  if (cached) return cached;
+  const result = await generatePostmortem(ai, incident, history, { timeoutMs: postmortemTimeoutMs });
+  const payload = { caseId, version: incident.version, ...result };
+  rememberPostmortem(signature, payload);
+  return payload;
+}
+
 async function routingSuggest(body) {
   if (!routingEnabled) {
     throw new HttpError('Маршрутизация отключена', 404, 'routing_disabled');
@@ -855,7 +911,8 @@ function metaPayload() {
     transitions: STATUS_TRANSITIONS,
     teams: MTS_TEAMS,
     assistantEnabled,
-    routingEnabled
+    routingEnabled,
+    postmortemEnabled
   };
 }
 
@@ -1102,6 +1159,11 @@ async function handleApi(req, res, pathname, search = '') {
   if (req.method === 'POST' && pathname === '/api/v1/routing/suggest') {
     enforceRoutingRateLimit(session.user);
     sendJson(res, 200, await routingSuggest(await readObject(req)));
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/postmortem') {
+    enforcePostmortemRateLimit(session.user);
+    sendJson(res, 200, await postmortemGenerate(await readObject(req)));
     return;
   }
 

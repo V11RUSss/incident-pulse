@@ -350,6 +350,9 @@ api:
 | `ROUTING_ENABLED` | `true` |
 | `ROUTING_RATE_LIMIT_PER_MIN` | `30` |
 | `ROUTING_TIMEOUT_MS` | `20000` |
+| `POSTMORTEM_ENABLED` | `true` |
+| `POSTMORTEM_RATE_LIMIT_PER_MIN` | `10` |
+| `POSTMORTEM_TIMEOUT_MS` | `60000` |
 | `PUBLIC_ORIGIN` | пусто |
 | `COOKIE_SECURE` | `false` |
 | `SESSION_TTL_MS` | `604800000` |
@@ -546,6 +549,67 @@ Content-Type: application/json
 подсказку и endpoint. Ошибка подсказки дешёвая: назначение всё равно делает
 человек.
 
+### Постмортем и ретро
+
+История кейса уже пишется в `history`; постмортем делает её читаемой.
+Audit-журнал для этого не используется: там административные действия, а не
+жизненный цикл инцидента.
+
+В панели **«ИИ-анализ»** есть кнопка **«Постмортем»**. Для активного кейса она
+называется «Промежуточный разбор», для завершённого — «Собрать постмортем».
+Генерация запускается **только по клику**, не при открытии карточки.
+
+Результат раскрывается в диалоге:
+
+- **Что произошло** — краткий итог;
+- **Таймлайн** — фактические события из `store.listHistory()`: время, автор,
+  действие, команда/статус/приоритет;
+- **Почему** — причины и гипотезы с evidence и уровнем уверенности;
+- **Что улучшить** — конкретные действия, владелец и приоритет;
+- **Что прошло хорошо** и **Открытые вопросы** — если есть.
+
+Таймлайн строится **детерминированно на сервере** из истории. Модель не
+переписывает события — она добавляет summary, причины и улучшения. Это защищает
+от галлюцинаций с датами и действиями.
+
+```http
+POST /api/v1/postmortem
+Content-Type: application/json
+
+{"caseId":"..."}
+```
+
+Ответ:
+
+```json
+{
+  "caseId": "...",
+  "version": 3,
+  "timeline": [
+    {"at": 1763690000000, "actor": "Даниил", "event": "Взял инцидент в координацию", "kind": "fact"}
+  ],
+  "summary": "Инцидент обработан за 7 минут...",
+  "causes": [
+    {"text": "Задержка назначения команды", "evidence": "claim → team: 7 минут", "confidence": "medium"}
+  ],
+  "improvements": [
+    {"action": "Автоматически предлагать команду", "owner": "Координация", "priority": "high"}
+  ],
+  "wentWell": ["SLA не нарушен"],
+  "openQuestions": [],
+  "source": "ai",
+  "generatedAt": 1763690120000
+}
+```
+
+Если AI недоступен, возвращается `source: "fallback"` с фактическим таймлайном,
+без выдуманных причин; блок «Почему» пишет, что причина не зафиксирована.
+Кнопки **«Скопировать»** и **«Скачать .md»** экспортируют Markdown.
+
+Кэш — 10 минут по `caseId + version + история`; лимит
+`POSTMORTEM_RATE_LIMIT_PER_MIN`; таймаут `POSTMORTEM_TIMEOUT_MS`;
+флаг `POSTMORTEM_ENABLED=false` скрывает кнопку и endpoint.
+
 ## Тесты
 
 Тесты используют только встроенный `node:test` и временные каталоги ОС; серверы не запускаются, зависимости не нужны:
@@ -555,7 +619,7 @@ cd services/app && npm test
 cd services/itsm-mock && npm test
 ```
 
-Покрыто: агрегация `affectedUsers`/`activeAffectedUsers` и автоприоритет, взаимоисключающие группы отображения, закрытые источники, ручной override, `STATUS_TRANSITIONS`, идемпотентность `applyDelta`, stale и пустой delta без роста версий, `resetSyncState`, миграция ролей и первый администратор, валидация mock PATCH, карантин `state.json`, эндпоинты `critical`/`reset`, каденция критических событий на 40 tick-ах, keyless-клиент vLLM, очистка Qwen thinking-блока, whitelist-валидация и исполнение фильтров, парсер ассистента и отказ от неизвестных полей, fallback-правила маршрутизации и валидация команды по `MTS_TEAMS`.
+Покрыто: агрегация `affectedUsers`/`activeAffectedUsers` и автоприоритет, взаимоисключающие группы отображения, закрытые источники, ручной override, `STATUS_TRANSITIONS`, идемпотентность `applyDelta`, stale и пустой delta без роста версий, `resetSyncState`, миграция ролей и первый администратор, валидация mock PATCH, карантин `state.json`, эндпоинты `critical`/`reset`, каденция критических событий на 40 tick-ах, keyless-клиент vLLM, очистка Qwen thinking-блока, whitelist-валидация и исполнение фильтров, парсер ассистента и отказ от неизвестных полей, fallback-правила маршрутизации и валидация команды по `MTS_TEAMS`, нормализация истории и fallback постмортема, проверка fact/hypothesis-полей.
 
 ## Постоянное хранение и сброс
 
@@ -595,7 +659,7 @@ rm -f "$COOKIE_JAR"
 
 | Сервис | Контейнер / хост | Основные настройки |
 | --- | --- | --- |
-| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true`, `AI_BASE_URL=https://api.deepseek.com`, `AI_MODEL=deepseek-chat`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `PUBLIC_ORIGIN=`, `SESSION_TTL_MS=604800000` |
+| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true`, `AI_BASE_URL=https://api.deepseek.com`, `AI_MODEL=deepseek-chat`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `PUBLIC_ORIGIN=`, `SESSION_TTL_MS=604800000` |
 | `itsm-mock` | `3001 / 8081` | `DATA_DIR=/data`, пустое начальное состояние на новом volume |
 
 `app` и `itsm-mock` собираются из корневого build context; локальный vLLM поднимается отдельными `docker-compose.vllm*.yml` только в `--mode=vllm`. `app` стартует после успешного healthcheck mock через `depends_on` с `service_healthy`; недоступный AI-бэкенд не блокирует запуск и уходит в AI-fallback.

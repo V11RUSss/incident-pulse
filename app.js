@@ -12,6 +12,7 @@ const FALLBACK_META = Object.freeze({
   transitions: { 0: [2, 20, 7, 10], 2: [20, 7, 10], 20: [7, 10], 7: [10], 10: [] },
   assistantEnabled: true,
   routingEnabled: true,
+  postmortemEnabled: true,
   teams: [
     'КЦ ИТ Координаторы Массовых Инцидентов',
     'МТС ИТ Поддержка Mobile voice',
@@ -99,6 +100,15 @@ const state = {
     queueOpen: false,
     queueRun: 0,
     queueController: null
+  },
+  postmortem: {
+    loading: false,
+    controller: null,
+    data: null,
+    cache: new Map(),
+    history: [],
+    caseId: null,
+    signature: null
   }
 };
 
@@ -137,7 +147,24 @@ const elements = {
   routingQueueCount: document.querySelector('#routing-queue-count'),
   routingPanel: document.querySelector('#routing-panel'),
   routingClose: document.querySelector('#routing-close'),
-  routingList: document.querySelector('#routing-list')
+  routingList: document.querySelector('#routing-list'),
+  postmortemButton: document.querySelector('#postmortem-button'),
+  postmortemButtonLabel: document.querySelector('#postmortem-button-label'),
+  postmortemPanel: document.querySelector('#postmortem-panel'),
+  postmortemSource: document.querySelector('#postmortem-source'),
+  postmortemStatus: document.querySelector('#postmortem-status'),
+  postmortemContent: document.querySelector('#postmortem-content'),
+  postmortemSummary: document.querySelector('#postmortem-summary'),
+  postmortemTimeline: document.querySelector('#postmortem-timeline'),
+  postmortemCauses: document.querySelector('#postmortem-causes'),
+  postmortemImprovements: document.querySelector('#postmortem-improvements'),
+  postmortemWentWellSection: document.querySelector('#postmortem-wentwell-section'),
+  postmortemWentWell: document.querySelector('#postmortem-wentwell'),
+  postmortemQuestionsSection: document.querySelector('#postmortem-questions-section'),
+  postmortemQuestions: document.querySelector('#postmortem-questions'),
+  postmortemClose: document.querySelector('#postmortem-close'),
+  postmortemCopy: document.querySelector('#postmortem-copy'),
+  postmortemDownload: document.querySelector('#postmortem-download')
 };
 
 /* ----------------------------------------------------------------- utils */
@@ -421,6 +448,7 @@ function handleUnauthorized() {
   closeEvents();
   resetAssistantUi();
   resetRoutingUi();
+  resetPostmortem({ abort: true, clearHistory: true, clearCache: true });
   setUser(null);
   state.incidents = [];
   state.counts = null;
@@ -441,7 +469,8 @@ async function loadMeta() {
         transitions: data.transitions,
         teams: data.teams.length ? data.teams : FALLBACK_META.teams,
         assistantEnabled: data.assistantEnabled !== false,
-        routingEnabled: data.routingEnabled !== false
+        routingEnabled: data.routingEnabled !== false,
+        postmortemEnabled: data.postmortemEnabled !== false
       };
     } else {
       state.meta = FALLBACK_META;
@@ -451,6 +480,7 @@ async function loadMeta() {
   }
   syncAssistantVisibility();
   syncRoutingVisibility();
+  updatePostmortemButton();
 }
 
 async function loadCoordinators() {
@@ -1466,6 +1496,343 @@ async function assignRoutingFromQueue(incident, data, row) {
   }
 }
 
+/* --------------------------------------------------------------- postmortem */
+
+function postmortemSignature(incident, history) {
+  if (!incident) return '';
+  const items = Array.isArray(history) ? history : [];
+  return String(incident.caseId) + ':' + String(incident.version) + ':' + items.length + ':' + (items[0] ? items[0].id : 0);
+}
+
+function updatePostmortemButton() {
+  if (!elements.postmortemButton) return;
+  const enabled = meta().postmortemEnabled !== false;
+  elements.postmortemButton.hidden = !enabled;
+  if (!enabled) {
+    if (state.postmortem.controller) {
+      state.postmortem.controller.abort();
+      state.postmortem.controller = null;
+    }
+    state.postmortem.loading = false;
+    if (elements.postmortemPanel) elements.postmortemPanel.hidden = true;
+    return;
+  }
+  const incident = currentIncident();
+  const hasHistory = state.postmortem.history.length > 0;
+  const loading = state.postmortem.loading;
+  elements.postmortemButton.disabled = !incident || !hasHistory || loading;
+  if (elements.postmortemButtonLabel) {
+    if (loading) elements.postmortemButtonLabel.textContent = 'Собираю…';
+    else if (incident && (incident.groups.includes('closed') || incident.groups.includes('research'))) {
+      elements.postmortemButtonLabel.textContent = 'Собрать постмортем';
+    } else {
+      elements.postmortemButtonLabel.textContent = 'Промежуточный разбор';
+    }
+  }
+  elements.postmortemButton.title = !incident
+    ? 'Откройте инцидент'
+    : !hasHistory
+      ? 'У инцидента пока нет истории изменений'
+      : 'Собрать разбор по истории изменений';
+}
+
+function resetPostmortem({ abort = false, clearHistory = false, clearCache = false } = {}) {
+  if (abort && state.postmortem.controller) {
+    state.postmortem.controller.abort();
+    state.postmortem.controller = null;
+  }
+  state.postmortem.loading = false;
+  state.postmortem.data = null;
+  state.postmortem.signature = null;
+  if (clearHistory) {
+    state.postmortem.history = [];
+    state.postmortem.caseId = null;
+  }
+  if (clearCache) state.postmortem.cache.clear();
+  if (elements.postmortemPanel) elements.postmortemPanel.hidden = true;
+  if (elements.postmortemContent) elements.postmortemContent.hidden = true;
+  if (elements.postmortemStatus) {
+    elements.postmortemStatus.hidden = true;
+    elements.postmortemStatus.textContent = '';
+    elements.postmortemStatus.classList.remove('is-error');
+  }
+  if (elements.postmortemSource) {
+    elements.postmortemSource.textContent = '';
+    elements.postmortemSource.className = 'postmortem-source';
+  }
+  updatePostmortemButton();
+}
+
+function closePostmortem() {
+  if (state.postmortem.controller) {
+    state.postmortem.controller.abort();
+    state.postmortem.controller = null;
+  }
+  state.postmortem.loading = false;
+  if (elements.postmortemPanel) elements.postmortemPanel.hidden = true;
+  updatePostmortemButton();
+}
+
+function postmortemBadge(label, level) {
+  const badge = document.createElement('span');
+  badge.className = 'postmortem-badge ' + (level || 'low');
+  badge.textContent = label;
+  return badge;
+}
+
+function confidenceLabel(value) {
+  return ({ high: 'высокая', medium: 'средняя', low: 'низкая' })[value] || 'гипотеза';
+}
+
+function priorityLabelForRetro(value) {
+  return ({ high: 'высокий', medium: 'средний', low: 'низкий' })[value] || 'средний';
+}
+
+function renderPostmortem(data) {
+  const incident = currentIncident();
+  if (!incident || !data) return;
+  state.postmortem.data = data;
+  state.postmortem.signature = postmortemSignature(incident, state.postmortem.history);
+  if (elements.postmortemPanel) elements.postmortemPanel.hidden = false;
+  if (elements.postmortemStatus) {
+    elements.postmortemStatus.hidden = true;
+    elements.postmortemStatus.textContent = '';
+    elements.postmortemStatus.classList.remove('is-error');
+  }
+  if (elements.postmortemSource) {
+    elements.postmortemSource.textContent = data.source === 'ai' ? 'ИИ' : 'Фактологический таймлайн';
+    elements.postmortemSource.className = 'postmortem-source' + (data.source === 'ai' ? '' : ' is-fallback');
+  }
+  if (elements.postmortemSummary) elements.postmortemSummary.textContent = data.summary || '';
+  if (elements.postmortemContent) elements.postmortemContent.hidden = false;
+
+  if (elements.postmortemTimeline) {
+    elements.postmortemTimeline.replaceChildren();
+    for (const event of data.timeline || []) {
+      const item = document.createElement('li');
+      const eventText = document.createElement('span');
+      eventText.className = 'postmortem-event';
+      eventText.textContent = event.event;
+      const meta = document.createElement('span');
+      meta.className = 'postmortem-meta';
+      meta.textContent = fullDateTime.format(event.at) + ' · ' + event.actor;
+      item.append(eventText, meta);
+      elements.postmortemTimeline.appendChild(item);
+    }
+    if (!data.timeline || !data.timeline.length) {
+      const item = document.createElement('li');
+      item.textContent = 'В истории пока нет событий.';
+      elements.postmortemTimeline.appendChild(item);
+    }
+  }
+
+  if (elements.postmortemCauses) {
+    elements.postmortemCauses.replaceChildren();
+    const causes = data.causes || [];
+    if (!causes.length) {
+      const item = document.createElement('li');
+      item.textContent = 'Причины в истории не зафиксированы.';
+      elements.postmortemCauses.appendChild(item);
+    } else {
+      for (const cause of causes) {
+        const item = document.createElement('li');
+        const text = document.createElement('strong');
+        text.textContent = cause.text;
+        item.appendChild(text);
+        if (cause.evidence) {
+          const evidence = document.createElement('span');
+          evidence.className = 'postmortem-evidence';
+          evidence.textContent = 'Evidence: ' + cause.evidence;
+          item.appendChild(evidence);
+        }
+        item.appendChild(postmortemBadge(confidenceLabel(cause.confidence), cause.confidence));
+        elements.postmortemCauses.appendChild(item);
+      }
+    }
+  }
+
+  if (elements.postmortemImprovements) {
+    elements.postmortemImprovements.replaceChildren();
+    const improvements = data.improvements || [];
+    if (!improvements.length) {
+      const item = document.createElement('li');
+      item.textContent = 'Улучшения не предложены.';
+      elements.postmortemImprovements.appendChild(item);
+    } else {
+      for (const improvement of improvements) {
+        const item = document.createElement('li');
+        const text = document.createElement('strong');
+        text.textContent = improvement.action;
+        item.appendChild(text);
+        if (improvement.owner) {
+          const owner = document.createElement('span');
+          owner.className = 'postmortem-owner';
+          owner.textContent = 'Владелец: ' + improvement.owner;
+          item.appendChild(owner);
+        }
+        item.appendChild(postmortemBadge('приоритет: ' + priorityLabelForRetro(improvement.priority), improvement.priority));
+        elements.postmortemImprovements.appendChild(item);
+      }
+    }
+  }
+
+  const renderStringList = (list, target, section) => {
+    if (!target || !section) return;
+    target.replaceChildren();
+    const values = Array.isArray(list) ? list : [];
+    section.hidden = !values.length;
+    for (const value of values) {
+      const item = document.createElement('li');
+      item.textContent = value;
+      target.appendChild(item);
+    }
+  };
+  renderStringList(data.wentWell, elements.postmortemWentWell, elements.postmortemWentWellSection);
+  renderStringList(data.openQuestions, elements.postmortemQuestions, elements.postmortemQuestionsSection);
+
+  if (elements.postmortemPanel) {
+    requestAnimationFrame(() => elements.postmortemPanel.scrollIntoView({ block: 'start', behavior: 'smooth' }));
+  }
+  updatePostmortemButton();
+}
+
+async function requestPostmortem() {
+  const incident = currentIncident();
+  if (!incident || state.postmortem.loading || meta().postmortemEnabled === false) return;
+  if (!state.postmortem.history.length) return;
+  const signature = postmortemSignature(incident, state.postmortem.history);
+  const cached = state.postmortem.cache.get(signature);
+  if (cached) {
+    renderPostmortem(cached);
+    return;
+  }
+  if (state.postmortem.controller) state.postmortem.controller.abort();
+  const controller = new AbortController();
+  state.postmortem.controller = controller;
+  state.postmortem.loading = true;
+  state.postmortem.signature = signature;
+  updatePostmortemButton();
+  if (elements.postmortemPanel) elements.postmortemPanel.hidden = false;
+  if (elements.postmortemContent) elements.postmortemContent.hidden = true;
+  if (elements.postmortemStatus) {
+    elements.postmortemStatus.hidden = false;
+    elements.postmortemStatus.textContent = 'Собираю постмортем…';
+    elements.postmortemStatus.classList.remove('is-error');
+  }
+  if (elements.postmortemSource) {
+    elements.postmortemSource.textContent = '';
+    elements.postmortemSource.className = 'postmortem-source';
+  }
+  try {
+    const data = await api('/api/v1/postmortem', {
+      method: 'POST',
+      body: { caseId: incident.caseId },
+      signal: controller.signal
+    });
+    if (state.activeId !== incident.caseId) return;
+    const current = findIncident(incident.caseId);
+    if (!current || postmortemSignature(current, state.postmortem.history) !== signature) return;
+    state.postmortem.cache.set(signature, data);
+    renderPostmortem(data);
+  } catch (error) {
+    if (error.name === 'AbortError') return;
+    if (error.status === 401) {
+      handleUnauthorized();
+      return;
+    }
+    if (elements.postmortemContent) elements.postmortemContent.hidden = true;
+    if (elements.postmortemStatus) {
+      elements.postmortemStatus.hidden = false;
+      elements.postmortemStatus.textContent = 'Не удалось собрать постмортем: ' + error.message;
+      elements.postmortemStatus.classList.add('is-error');
+    }
+  } finally {
+    state.postmortem.loading = false;
+    if (state.postmortem.controller === controller) state.postmortem.controller = null;
+    updatePostmortemButton();
+  }
+}
+
+function postmortemMarkdown(data) {
+  const incident = currentIncident();
+  if (!incident || !data) return '';
+  const lines = [];
+  lines.push('# Постмортем ' + incident.id);
+  lines.push('');
+  lines.push('**Источник:** ' + (data.source === 'ai' ? 'ИИ' : 'Фактологический таймлайн'));
+  lines.push('**Сформирован:** ' + fullDateTime.format(data.generatedAt || Date.now()));
+  lines.push('');
+  lines.push('## Что произошло');
+  lines.push(data.summary || '');
+  lines.push('');
+  lines.push('## Таймлайн');
+  for (const event of data.timeline || []) {
+    lines.push('- ' + fullDateTime.format(event.at) + ' · ' + event.actor + ' — ' + event.event);
+  }
+  lines.push('');
+  lines.push('## Почему');
+  if (!data.causes || !data.causes.length) lines.push('- Причины в истории не зафиксированы.');
+  for (const cause of data.causes || []) {
+    lines.push('- **' + cause.text + '**' + (cause.evidence ? ' — ' + cause.evidence : '') + ' (' + confidenceLabel(cause.confidence) + ')');
+  }
+  lines.push('');
+  lines.push('## Что улучшить');
+  if (!data.improvements || !data.improvements.length) lines.push('- Улучшения не предложены.');
+  for (const item of data.improvements || []) {
+    lines.push('- ' + item.action + (item.owner ? ' — ' + item.owner : '') + ' (' + priorityLabelForRetro(item.priority) + ')');
+  }
+  if (data.wentWell && data.wentWell.length) {
+    lines.push('');
+    lines.push('## Что прошло хорошо');
+    for (const item of data.wentWell) lines.push('- ' + item);
+  }
+  if (data.openQuestions && data.openQuestions.length) {
+    lines.push('');
+    lines.push('## Открытые вопросы');
+    for (const item of data.openQuestions) lines.push('- ' + item);
+  }
+  return lines.join('\n');
+}
+
+async function copyPostmortem() {
+  const markdown = postmortemMarkdown(state.postmortem.data);
+  if (!markdown) return;
+  try {
+    await navigator.clipboard.writeText(markdown);
+    if (elements.postmortemStatus) {
+      elements.postmortemStatus.hidden = false;
+      elements.postmortemStatus.textContent = 'Скопировано в буфер обмена';
+      elements.postmortemStatus.classList.remove('is-error');
+    }
+    setTimeout(() => {
+      if (elements.postmortemStatus && elements.postmortemStatus.textContent === 'Скопировано в буфер обмена') {
+        elements.postmortemStatus.hidden = true;
+      }
+    }, 1800);
+  } catch {
+    if (elements.postmortemStatus) {
+      elements.postmortemStatus.hidden = false;
+      elements.postmortemStatus.textContent = 'Не удалось скопировать';
+      elements.postmortemStatus.classList.add('is-error');
+    }
+  }
+}
+
+function downloadPostmortem() {
+  const markdown = postmortemMarkdown(state.postmortem.data);
+  const incident = currentIncident();
+  if (!markdown || !incident) return;
+  const blob = new Blob([markdown], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'postmortem-' + String(incident.id).replace(/[^a-zA-Z0-9._-]/g, '-') + '.md';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 function announce(message, critical = false) {
   const target = critical ? elements.criticalAnnouncer : elements.resultsStatus;
   clearTimeout(state.announcementTimer);
@@ -1746,10 +2113,12 @@ function populateDialog(incident, { resetInputs = false } = {}) {
   if (resetInputs) {
     resetAiPanel();
     resetRoutingSuggestion({ abort: true });
+    resetPostmortem({ abort: true, clearHistory: true });
     clearDialogMessages();
     document.querySelector('#solution-input').value = '';
   }
   requestRoutingSuggestion(incident);
+  updatePostmortemButton();
 }
 
 function openIncident(caseId) {
@@ -1808,9 +2177,21 @@ async function loadHistory(caseId) {
   list.innerHTML = '<li class="history-empty">Загрузка истории…</li>';
   try {
     const data = await api(`/api/v1/incidents/${encodeURIComponent(caseId)}/history`);
-    renderHistory(Array.isArray(data.history) ? data.history : []);
+    const history = Array.isArray(data.history) ? data.history : [];
+    state.postmortem.caseId = caseId;
+    state.postmortem.history = history;
+    const incident = findIncident(caseId);
+    const signature = postmortemSignature(incident, history);
+    if (state.postmortem.data && state.postmortem.signature !== signature) {
+      resetPostmortem({ abort: true });
+    }
+    updatePostmortemButton();
+    renderHistory(history);
   } catch (error) {
     if (error.status === 401) { handleUnauthorized(); return; }
+    state.postmortem.history = [];
+    if (state.postmortem.data) resetPostmortem({ abort: true });
+    updatePostmortemButton();
     list.innerHTML = `<li class="history-empty">Не удалось загрузить историю: ${escapeHtml(error.message)}</li>`;
   }
 }
@@ -2384,6 +2765,7 @@ async function logout() {
   elements.risk.checked = false;
   resetAssistantUi();
   resetRoutingUi();
+  resetPostmortem({ abort: true, clearHistory: true, clearCache: true });
   if (elements.adminDialog.open) elements.adminDialog.close();
   showView('auth');
 }
@@ -2530,6 +2912,10 @@ function bindEvents() {
     closeRoutingPanel();
     elements.routingQueueButton.focus();
   });
+  elements.postmortemButton.addEventListener('click', requestPostmortem);
+  elements.postmortemClose.addEventListener('click', closePostmortem);
+  elements.postmortemCopy.addEventListener('click', copyPostmortem);
+  elements.postmortemDownload.addEventListener('click', downloadPostmortem);
   document.addEventListener('keydown', event => {
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
       if (elements.dialog.open || (elements.adminDialog && elements.adminDialog.open)) return;
@@ -2550,6 +2936,7 @@ function bindEvents() {
 
   elements.dialog.addEventListener('close', () => {
     resetRoutingSuggestion({ abort: true });
+    closePostmortem();
     state.activeId = null;
     const buttons = state.lastOpenedCaseId
       ? [...document.querySelectorAll(`[data-open-incident="${CSS.escape(state.lastOpenedCaseId)}"]`)]
