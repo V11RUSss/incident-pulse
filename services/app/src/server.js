@@ -1,0 +1,1338 @@
+'use strict';
+
+const crypto = require('node:crypto');
+const fs = require('node:fs');
+const http = require('node:http');
+const path = require('node:path');
+const { Auth, AuthError } = require('./auth');
+const { AiClient, AiError } = require('./ai');
+const { askAssistant } = require('./assistant');
+const { suggestTeam } = require('./routing');
+const { filterIncidents } = require('../lib/filters');
+const { ItsmClient, ItsmError } = require('./itsm');
+const { Store } = require('./store');
+const {
+  PRIORITIES,
+  PRIORITY_TEXT,
+  STATES,
+  ValidationError,
+  countIncidents,
+  integer,
+  isObject,
+  nullableText,
+  parseTimestamp
+} = require('../lib/incidents');
+const { MTS_TEAMS, STATUS_TRANSITIONS } = require('../lib/meta');
+
+const REPOSITORY_ROOT = path.resolve(__dirname, '../../..');
+const STATIC_DIR = path.resolve(process.env.STATIC_DIR || REPOSITORY_ROOT);
+const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(REPOSITORY_ROOT, '.data'));
+const MAX_JSON_BYTES = 5 * 1024 * 1024;
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const MIME_TYPES = Object.freeze({
+  '.css': 'text/css; charset=utf-8',
+  '.gif': 'image/gif',
+  '.html': 'text/html; charset=utf-8',
+  '.ico': 'image/x-icon',
+  '.jpeg': 'image/jpeg',
+  '.jpg': 'image/jpeg',
+  '.js': 'text/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.png': 'image/png',
+  '.svg': 'image/svg+xml; charset=utf-8',
+  '.webp': 'image/webp',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2'
+});
+const HTML_SECURITY_HEADERS = Object.freeze({
+  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  'X-Frame-Options': 'DENY',
+  'Referrer-Policy': 'no-referrer'
+});
+
+function configuredInteger(value, fallback, minimum = 1) {
+  const converted = Number(value);
+  return Number.isInteger(converted) && converted >= minimum ? converted : fallback;
+}
+
+const port = configuredInteger(process.env.PORT, 3000, 0);
+const pollIntervalMs = configuredInteger(process.env.POLL_INTERVAL_MS, 2000);
+const itsmTimeoutMs = configuredInteger(process.env.ITSM_TIMEOUT_MS, 5000);
+const demoGeneration = process.env.DEMO_GENERATION === 'true';
+const aiFallback = process.env.AI_FALLBACK !== 'false';
+const aiRateLimitPerMinute = configuredInteger(process.env.AI_RATE_LIMIT_PER_MIN, 10, 0);
+const assistantEnabled = process.env.ASSISTANT_ENABLED !== 'false';
+const assistantRateLimitPerMinute = configuredInteger(process.env.ASSISTANT_RATE_LIMIT_PER_MIN, 20, 0);
+const routingEnabled = process.env.ROUTING_ENABLED !== 'false';
+const routingRateLimitPerMinute = configuredInteger(process.env.ROUTING_RATE_LIMIT_PER_MIN, 30, 0);
+const routingTimeoutMs = configuredInteger(process.env.ROUTING_TIMEOUT_MS, 20000, 1000);
+const publicOrigin = String(process.env.PUBLIC_ORIGIN || '').trim().replace(/\/+$/, '');
+const AI_RATE_WINDOW_MS = 60 * 1000;
+const ASSISTANT_CACHE_TTL_MS = 10 * 60 * 1000;
+const ASSISTANT_CACHE_MAX = 200;
+const ASSISTANT_TEXT_MAX = 400;
+const ROUTING_CACHE_TTL_MS = 10 * 60 * 1000;
+const ROUTING_CACHE_MAX = 500;
+const LOGIN_FAILURE_LIMIT = 10;
+const LOGIN_FAILURE_WINDOW_MS = 5 * 60 * 1000;
+const LOGIN_FAILURE_KEYS_LIMIT = 5000;
+const aiUsage = new Map();
+const assistantUsage = new Map();
+const assistantCache = new Map();
+const routingUsage = new Map();
+const routingCache = new Map();
+const loginFailures = new Map();
+const store = new Store(DATA_DIR);
+const auth = new Auth(store);
+const ai = new AiClient();
+const itsm = new ItsmClient(process.env.ITSM_MOCK_URL || 'http://127.0.0.1:3001', itsmTimeoutMs);
+const eventClients = new Set();
+
+let operationTail = Promise.resolve();
+let pendingOperations = 0;
+let pollTimer;
+let sessionCleanupTimer;
+let shuttingDown = false;
+let storeClosed = false;
+
+class HttpError extends Error {
+  constructor(message, status, code = null) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+class ConflictError extends HttpError {
+  constructor(incident) {
+    super('Версия инцидента изменилась; повторите действие с актуальным expectedVersion', 409);
+    this.incident = incident;
+  }
+}
+
+function enqueue(operation) {
+  pendingOperations += 1;
+  const result = operationTail.then(operation, operation);
+  operationTail = result.catch(() => {});
+  return result.finally(() => {
+    pendingOperations -= 1;
+  });
+}
+
+function sendJson(res, status, payload, headers = {}) {
+  const body = JSON.stringify(payload);
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff',
+    ...headers
+  });
+  res.end(body);
+}
+
+function sendError(res, error) {
+  const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 600
+    ? error.status
+    : 500;
+  const payload = { error: status === 500 ? 'Внутренняя ошибка сервера' : error.message };
+  if (status !== 500 && typeof error.code === 'string' && error.code) payload.code = error.code;
+  if (error instanceof ConflictError) {
+    payload.incident = error.incident;
+    payload.currentVersion = error.incident.version;
+  }
+  if (status === 500) console.error(error);
+  if (!res.headersSent) sendJson(res, status, payload);
+  else res.destroy();
+}
+
+async function readJson(req) {
+  const contentType = String(req.headers['content-type'] || '');
+  if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+    req.resume();
+    throw new HttpError('Ожидался Content-Type: application/json', 415);
+  }
+  const declaredLength = Number(req.headers['content-length']);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_JSON_BYTES) {
+    req.resume();
+    throw new HttpError('JSON body превышает 5 MiB', 413);
+  }
+
+  const chunks = [];
+  let size = 0;
+  let tooLarge = false;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > MAX_JSON_BYTES) {
+      tooLarge = true;
+      chunks.length = 0;
+    } else if (!tooLarge) {
+      chunks.push(chunk);
+    }
+  }
+  if (tooLarge) throw new HttpError('JSON body превышает 5 MiB', 413);
+  if (size === 0) throw new HttpError('JSON body не должен быть пустым', 400);
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch {
+    throw new HttpError('Некорректный JSON', 400);
+  }
+}
+
+async function readObject(req) {
+  const body = await readJson(req);
+  if (!isObject(body)) throw new HttpError('Ожидался JSON-объект', 400);
+  return body;
+}
+
+async function readOptionalObject(req) {
+  const declaredLength = req.headers['content-length'];
+  const chunked = req.headers['transfer-encoding'] !== undefined;
+  const hasBody = chunked || (declaredLength !== undefined && Number(declaredLength) !== 0);
+  if (!hasBody) return {};
+  return readObject(req);
+}
+
+function checkOrigin(req) {
+  if (!MUTATING_METHODS.has(req.method) || req.headers.origin === undefined) return;
+  const host = req.headers.host;
+  if (!host) throw new HttpError('Origin не совпадает с origin запроса', 403);
+  const expected = publicOrigin || `${auth.secure ? 'https' : 'http'}://${host}`;
+  let actual;
+  try {
+    actual = new URL(String(req.headers.origin)).origin;
+  } catch {
+    throw new HttpError('Origin не совпадает с origin запроса', 403);
+  }
+  if (actual !== expected) throw new HttpError('Origin не совпадает с origin запроса', 403);
+}
+
+function requireUser(req) {
+  const token = auth.tokenFromRequest(req);
+  const user = auth.userForToken(token);
+  if (!user) throw new HttpError('Требуется аутентификация', 401);
+  return { token, user };
+}
+
+function requireAdmin(user) {
+  if (!user || user.role !== 'admin') {
+    throw new HttpError('Требуются права администратора', 403, 'forbidden');
+  }
+}
+
+function enforceAiRateLimit(user) {
+  if (aiRateLimitPerMinute === 0) return;
+  const now = Date.now();
+  const timestamps = (aiUsage.get(user.id) || [])
+    .filter(timestamp => timestamp > now - AI_RATE_WINDOW_MS);
+  if (timestamps.length >= aiRateLimitPerMinute) {
+    aiUsage.set(user.id, timestamps);
+    throw new HttpError('Слишком много запросов ИИ; повторите позже', 429, 'rate_limited');
+  }
+  timestamps.push(now);
+  aiUsage.set(user.id, timestamps);
+}
+
+function enforceAssistantRateLimit(user) {
+  if (assistantRateLimitPerMinute === 0) return;
+  const now = Date.now();
+  const timestamps = (assistantUsage.get(user.id) || [])
+    .filter(timestamp => timestamp > now - AI_RATE_WINDOW_MS);
+  if (timestamps.length >= assistantRateLimitPerMinute) {
+    assistantUsage.set(user.id, timestamps);
+    throw new HttpError('Слишком много запросов к ассистенту; повторите позже', 429, 'rate_limited');
+  }
+  timestamps.push(now);
+  assistantUsage.set(user.id, timestamps);
+}
+
+function enforceRoutingRateLimit(user) {
+  if (routingRateLimitPerMinute === 0) return;
+  const now = Date.now();
+  const timestamps = (routingUsage.get(user.id) || [])
+    .filter(timestamp => timestamp > now - AI_RATE_WINDOW_MS);
+  if (timestamps.length >= routingRateLimitPerMinute) {
+    routingUsage.set(user.id, timestamps);
+    throw new HttpError('Слишком много запросов маршрутизации; повторите позже', 429, 'rate_limited');
+  }
+  timestamps.push(now);
+  routingUsage.set(user.id, timestamps);
+}
+
+function cachedAssistantResult(key) {
+  const entry = assistantCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    assistantCache.delete(key);
+    return null;
+  }
+  return entry.result;
+}
+
+function rememberAssistantResult(key, result) {
+  if (assistantCache.size >= ASSISTANT_CACHE_MAX) {
+    const oldest = assistantCache.keys().next().value;
+    if (oldest !== undefined) assistantCache.delete(oldest);
+  }
+  assistantCache.set(key, { result, expiresAt: Date.now() + ASSISTANT_CACHE_TTL_MS });
+}
+
+function cachedRoutingResult(key) {
+  const entry = routingCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    routingCache.delete(key);
+    return null;
+  }
+  return entry.result;
+}
+
+function rememberRoutingResult(key, result) {
+  if (routingCache.size >= ROUTING_CACHE_MAX) {
+    const oldest = routingCache.keys().next().value;
+    if (oldest !== undefined) routingCache.delete(oldest);
+  }
+  routingCache.set(key, { result, expiresAt: Date.now() + ROUTING_CACHE_TTL_MS });
+}
+
+function loginThrottleKey(req, body) {
+  const login = isObject(body) && typeof body.login === 'string' ? body.login.trim().toLowerCase() : '';
+  return `${req.socket.remoteAddress || 'unknown'}|${login}`;
+}
+
+function recentLoginFailures(key, now) {
+  const timestamps = (loginFailures.get(key) || [])
+    .filter(timestamp => timestamp > now - LOGIN_FAILURE_WINDOW_MS);
+  if (timestamps.length) loginFailures.set(key, timestamps);
+  else loginFailures.delete(key);
+  return timestamps;
+}
+
+function checkLoginRateLimit(key, now) {
+  if (recentLoginFailures(key, now).length >= LOGIN_FAILURE_LIMIT) {
+    throw new HttpError('Слишком много попыток входа; повторите позже', 429, 'rate_limited');
+  }
+}
+
+function recordLoginFailure(key, now) {
+  const timestamps = recentLoginFailures(key, now);
+  timestamps.push(now);
+  loginFailures.set(key, timestamps);
+  while (loginFailures.size > LOGIN_FAILURE_KEYS_LIMIT) {
+    loginFailures.delete(loginFailures.keys().next().value);
+  }
+}
+
+function openEvents(req, res) {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+    'X-Content-Type-Options': 'nosniff'
+  });
+  res.write('retry: 3000\n: connected\n\n');
+  const client = { res, heartbeat: null };
+  const cleanup = () => {
+    if (!eventClients.has(client)) return;
+    clearInterval(client.heartbeat);
+    eventClients.delete(client);
+  };
+  client.heartbeat = setInterval(() => {
+    if (!res.destroyed) res.write(`: heartbeat ${Date.now()}\n\n`);
+  }, 15000);
+  eventClients.add(client);
+  req.once('close', cleanup);
+  res.once('close', cleanup);
+}
+
+function writeEvent(client, event, data) {
+  if (client.res.destroyed) return;
+  try {
+    client.res.write(`event: ${event}\ndata: ${data}\n\n`);
+  } catch {
+    client.res.destroy();
+  }
+}
+
+function broadcastIncidents(changes) {
+  if (changes.added === 0 && changes.updated === 0) return;
+  const data = JSON.stringify({
+    type: 'incidents.changed',
+    added: changes.added,
+    updated: changes.updated,
+    source: changes.source
+  });
+  for (const client of eventClients) writeEvent(client, 'incidents', data);
+}
+
+function broadcastSync(payload) {
+  const data = JSON.stringify(payload);
+  for (const client of eventClients) writeEvent(client, 'sync', data);
+}
+
+async function loadDelta() {
+  try {
+    return { delta: await itsm.getChanges(store.getCurrentRevision()), reset: false };
+  } catch (error) {
+    if (!(error instanceof ItsmError) || error.code !== 'revision_ahead') throw error;
+    store.resetSyncState();
+    console.warn('ITSM revision опережает локальную; состояние синхронизации сброшено, выполняется полная перезагрузка');
+    return { delta: await itsm.getChanges(0), reset: true };
+  }
+}
+
+async function synchronize(source, generate = false) {
+  const previousSyncError = store.getSyncState().syncError;
+  try {
+    const demo = generate ? await itsm.demoTick() : null;
+    const { delta, reset } = await loadDelta();
+    const changes = store.applyDelta(delta.incidents, delta.revision);
+    if (reset) {
+      broadcastSync({ type: 'sync.recovered', lastSyncedAt: changes.lastSyncedAt, reset: true });
+    } else if (previousSyncError !== null) {
+      broadcastSync({ type: 'sync.recovered', lastSyncedAt: changes.lastSyncedAt });
+    }
+    broadcastIncidents({ ...changes, source });
+    return { ...changes, ...(demo ? { demo } : {}) };
+  } catch (error) {
+    const safeMessage = error instanceof ItsmError || error instanceof ValidationError
+      ? error.message
+      : 'Не удалось синхронизировать данные с ITSM';
+    store.recordSyncError(safeMessage);
+    if (previousSyncError !== safeMessage) {
+      broadcastSync({ type: 'sync.error', error: safeMessage });
+    }
+    throw error;
+  }
+}
+
+function dashboard() {
+  const incidents = store.listCases();
+  return {
+    incidents,
+    counts: countIncidents(incidents),
+    ...store.getSyncState()
+  };
+}
+
+function requiredCase(caseId) {
+  const incident = store.getCase(caseId);
+  if (!incident) throw new HttpError('Инцидент не найден', 404);
+  return incident;
+}
+
+function checkExpectedVersion(body, incident) {
+  const expectedVersion = integer(body.expectedVersion);
+  if (expectedVersion === null || expectedVersion < 0) {
+    throw new HttpError('expectedVersion должен быть неотрицательным целым числом', 400);
+  }
+  if (expectedVersion !== incident.version) throw new ConflictError(incident);
+}
+
+function checkOptionalExpectedVersion(body, incident) {
+  if (!Object.hasOwn(body, 'expectedVersion')) return;
+  const expectedVersion = integer(body.expectedVersion);
+  if (expectedVersion === null || expectedVersion < 0) {
+    throw new HttpError('expectedVersion должен быть неотрицательным целым числом', 400);
+  }
+  if (expectedVersion !== incident.version) throw new ConflictError(incident);
+}
+
+async function claimCase(caseId, user, body) {
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    checkExpectedVersion(body, current);
+    if (current.coordinatorId === user.id) return { incident: current };
+    await itsm.bulkUpdate(current.sourceIds, { coordinatorId: user.id, coordinatorName: user.name });
+    await synchronize('claim');
+    store.recordHistory({
+      caseId,
+      user,
+      action: 'claim',
+      details: { coordinatorId: user.id, coordinatorName: user.name }
+    });
+    return { incident: requiredCase(caseId) };
+  });
+}
+
+async function reassignCase(caseId, user, body) {
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    checkExpectedVersion(body, current);
+    const coordinatorId = nullableText(body.coordinatorId);
+    if (!coordinatorId) throw new HttpError('coordinatorId обязателен', 400);
+    const coordinator = store.getUserById(coordinatorId);
+    if (!coordinator) throw new HttpError('Координатор не найден', 404);
+    if (current.coordinatorId === coordinator.id) return { incident: current };
+    await itsm.bulkUpdate(current.sourceIds, {
+      coordinatorId: coordinator.id,
+      coordinatorName: coordinator.name
+    });
+    await synchronize('coordinator');
+    store.recordHistory({
+      caseId,
+      user,
+      action: 'reassign',
+      details: { coordinatorId: coordinator.id, coordinatorName: coordinator.name }
+    });
+    return { incident: requiredCase(caseId) };
+  });
+}
+
+async function setPriority(caseId, user, body) {
+  const priorityId = integer(body.priorityId);
+  if (!Object.hasOwn(PRIORITIES, priorityId)) {
+    throw new HttpError('priorityId должен быть равен 1, 2, 3 или 4', 400);
+  }
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    checkOptionalExpectedVersion(body, current);
+    if (current.priorityOverrideId === priorityId) return { incident: current };
+    await itsm.bulkUpdate(current.sourceIds, { priorityOverrideId: priorityId });
+    store.setPriorityOverride(caseId, priorityId);
+    await synchronize('priority');
+    store.recordHistory({
+      caseId,
+      user,
+      action: 'priority',
+      details: { priorityId, autoPriorityId: current.autoPriorityId }
+    });
+    return { incident: requiredCase(caseId) };
+  });
+}
+
+async function clearPriorityOverride(caseId, user) {
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    if (current.priorityOverrideId === null) return { incident: current };
+    await itsm.bulkUpdate(current.sourceIds, { priorityOverrideId: null });
+    store.setPriorityOverride(caseId, null);
+    await synchronize('priority');
+    store.recordHistory({
+      caseId,
+      user,
+      action: 'priority-override.delete',
+      details: { autoPriorityId: current.autoPriorityId }
+    });
+    return { incident: requiredCase(caseId) };
+  });
+}
+
+async function setDeadline(caseId, user, body) {
+  if (body.deadline !== null && body.deadline !== undefined && parseTimestamp(body.deadline) === null) {
+    throw new HttpError('deadline должен содержать корректную дату или null', 400);
+  }
+  const deadlineMs = body.deadline === undefined ? null : parseTimestamp(body.deadline);
+  const deadline = deadlineMs === null ? null : new Date(deadlineMs).toISOString();
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    checkOptionalExpectedVersion(body, current);
+    if (current.dueAt === deadlineMs) return { incident: current };
+    await itsm.bulkUpdate(current.sourceIds, { deadline });
+    await synchronize('deadline');
+    store.recordHistory({ caseId, user, action: 'deadline', details: { deadline: deadlineMs } });
+    return { incident: requiredCase(caseId) };
+  });
+}
+
+async function setTeam(caseId, user, body) {
+  const team = nullableText(body.team);
+  if (!team || team.length > 200) throw new HttpError('team обязателен и должен содержать не более 200 символов', 400);
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    checkOptionalExpectedVersion(body, current);
+    if (!current.groups.includes('active')) {
+      throw new HttpError('Передать команду можно только активному инциденту', 409);
+    }
+    if (current.team === team && current.stateId === 2) return { incident: current };
+    await itsm.bulkUpdate(current.sourceIds, {
+      assignedGroupName: team,
+      stateId: 2,
+      solution: null,
+      completionDate: null
+    });
+    await synchronize('team');
+    store.recordHistory({ caseId, user, action: 'team', details: { team, stateId: 2 } });
+    return { incident: requiredCase(caseId) };
+  });
+}
+
+async function setStatus(caseId, user, body) {
+  const stateId = integer(body.stateId);
+  if (!Object.hasOwn(STATES, stateId)) {
+    throw new HttpError('stateId должен быть равен 0, 2, 20, 7 или 10', 400);
+  }
+  if (body.solution !== undefined && body.solution !== null && typeof body.solution !== 'string') {
+    throw new HttpError('solution должен быть строкой или null', 400);
+  }
+  if (typeof body.solution === 'string' && body.solution.length > 10000) {
+    throw new HttpError('solution должен содержать не более 10000 символов', 400);
+  }
+
+  return enqueue(async () => {
+    const current = requiredCase(caseId);
+    checkOptionalExpectedVersion(body, current);
+    const allowedTransitions = STATUS_TRANSITIONS[current.stateId] || [];
+    if (!allowedTransitions.includes(stateId)) {
+      throw new HttpError(`Недопустимый переход статуса: ${current.stateId} → ${stateId}`, 409);
+    }
+    const active = stateId === 0 || stateId === 2;
+    const research = stateId === 20;
+    const closed = stateId === 7 || stateId === 10;
+    let solution = body.solution === undefined ? current.solution : nullableText(body.solution);
+    if (research && !solution) throw new HttpError('Для research требуется непустой solution', 400);
+
+    const patch = { stateId };
+    if (active) {
+      solution = null;
+      patch.solution = null;
+      patch.completionDate = null;
+    } else if (research) {
+      patch.solution = solution;
+      patch.completionDate = null;
+    } else if (closed) {
+      patch.solution = solution;
+      patch.completionDate = current.groups.includes('closed')
+        ? current.resolvedAt === null ? null : new Date(current.resolvedAt).toISOString()
+        : new Date().toISOString();
+    }
+
+    if (current.stateId === stateId && current.solution === solution) return { incident: current };
+    await itsm.bulkUpdate(current.sourceIds, patch);
+    await synchronize('status');
+    store.recordHistory({ caseId, user, action: 'status', details: { stateId, solution } });
+    return { incident: requiredCase(caseId) };
+  });
+}
+
+function decodeCaseId(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new HttpError('Некорректный caseId', 400);
+  }
+}
+
+const SLA_RISK_WINDOW_MS = 15 * 60 * 1000;
+const MAX_AI_ATTENTIONS = 20;
+const MAX_AI_HISTORY = 30;
+const MAX_AI_DETAILS_LENGTH = 1000;
+
+function incidentBrief(incident) {
+  return {
+    id: incident.id,
+    title: incident.title,
+    product: incident.product,
+    service: incident.service,
+    region: incident.region,
+    affectedUsers: incident.affectedUsers,
+    reportCount: incident.reportCount,
+    priority: incident.priority,
+    priorityId: incident.priorityId,
+    priorityText: incident.priorityText,
+    status: incident.status,
+    team: incident.team,
+    coordinatorName: incident.coordinatorName,
+    startedAt: incident.startedAt,
+    dueAt: incident.dueAt,
+    isNeedUp: incident.isNeedUp,
+    isMaster: incident.isMaster,
+    isEffect: incident.isEffect
+  };
+}
+
+function topCases(incidents) {
+  return incidents
+    .filter(incident => Array.isArray(incident.groups) && incident.groups.includes('active'))
+    .map(incidentBrief)
+    .sort((a, b) => {
+      const priorityDifference = (b.priorityId ?? 0) - (a.priorityId ?? 0);
+      if (priorityDifference) return priorityDifference;
+      if (a.dueAt !== null && b.dueAt !== null) return a.dueAt - b.dueAt;
+      if (a.dueAt !== null) return -1;
+      if (b.dueAt !== null) return 1;
+      return (b.affectedUsers ?? 0) - (a.affectedUsers ?? 0);
+    })
+    .slice(0, 8);
+}
+
+function compactDetails(details) {
+  if (details === undefined || details === null) return undefined;
+  const serialized = JSON.stringify(details);
+  if (!serialized || serialized === '{}') return undefined;
+  return serialized.length > MAX_AI_DETAILS_LENGTH ? `${serialized.slice(0, MAX_AI_DETAILS_LENGTH)}…` : serialized;
+}
+
+function buildDashboardPrompt(data) {
+  const incidents = Array.isArray(data.incidents) ? data.incidents : [];
+  const lines = [
+    'Составь краткую общую сводку по текущим инцидентам координатора: сколько активных/критических/research/SLA, затронутых пользователей, и три приоритетных внимания.',
+    'Текущее время (epoch ms):',
+    String(Date.now()),
+    'Счётчики:',
+    JSON.stringify(data.counts || {}),
+    'Наиболее приоритетные/SLA-рисковые/массовые активные инциденты:',
+    JSON.stringify(topCases(incidents))
+  ];
+  return lines.join('\n');
+}
+
+function buildIncidentPrompt(incident, history) {
+  const lines = [
+    'Составь сводку по инциденту: ситуация, динамика, SLA, рекомендуемая команда/действие.',
+    'Текущее время (epoch ms):',
+    String(Date.now()),
+    'Данные инцидента:',
+    JSON.stringify({
+      ...incidentBrief(incident),
+      description: incident.description,
+      scenario: incident.scenario,
+      prioritySource: incident.prioritySource,
+      groups: incident.groups,
+      resolvedAt: incident.resolvedAt,
+      solution: incident.solution
+    }),
+    'История изменений (новые записи первыми):',
+    JSON.stringify((history || []).slice(0, MAX_AI_HISTORY).map(item => ({
+      action: item.action,
+      user: item.userName,
+      at: item.createdAt,
+      details: compactDetails(item.details)
+    })))
+  ];
+  return lines.join('\n');
+}
+
+function firstString(...values) {
+  for (const value of values) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return '';
+}
+
+function asStringArray(value) {
+  if (Array.isArray(value)) {
+    return value.map(item => String(item)).filter(item => item.trim()).slice(0, MAX_AI_ATTENTIONS);
+  }
+  if (typeof value === 'string' && value.trim()) return [value.trim()];
+  if (value !== null && value !== undefined) return [String(value)];
+  return [];
+}
+
+function normalizeAiResult(result) {
+  return {
+    summary: firstString(result.summary, result.text, result.content),
+    attentions: asStringArray(
+      result.attentions ?? result.attention ?? result.alerts ?? result.warnings
+    ),
+    recommendation: firstString(result.recommendation, result.recommendations, result.advice, result.action)
+  };
+}
+
+function fallbackSummary() {
+  const data = dashboard();
+  const counts = data.counts || {};
+  const top = topCases(data.incidents || []);
+  const summary = `Автоматическая сводка. Активных инцидентов: ${counts.active ?? 0}, критических: ${counts.critical ?? 0}, высоких: ${counts.high ?? 0}, на исследовании: ${counts.research ?? 0}, в зоне риска SLA: ${counts.risk ?? 0}, затронуто пользователей: ${counts.affectedUsers ?? 0}.`;
+  const attentions = [];
+  if (counts.critical) attentions.push(`Требуют немедленного внимания ${counts.critical} критических инцидентов.`);
+  if (counts.coordination) attentions.push(`${counts.coordination} инцидентов ожидают назначения профильной команды.`);
+  if (counts.risk) attentions.push(`${counts.risk} инцидентов находятся в зоне риска SLA.`);
+  if (!attentions.length) attentions.push('Критических замечаний нет.');
+  if (top.length) attentions.push(`Крупнейший по охвату: ${top[0].id} (${top[0].affectedUsers ?? 0} пользователей).`);
+  const recommendation = counts.coordination
+    ? 'Приоритетно распределить инциденты, ожидающие назначения команды.'
+    : 'Продолжать мониторинг SLA и динамики массовых инцидентов.';
+  return { summary, attentions, recommendation };
+}
+
+function fallbackIncidentSummary(incident) {
+  const summary = `Автоматическая сводка. ${incident.title} (${incident.id}) — ${incident.product}, затронуто ${incident.affectedUsers} пользователей, приоритет ${incident.priorityText}, статус ${incident.status}.`;
+  const attentions = [];
+  if (incident.groups.includes('critical')) attentions.push('Критический приоритет требует немедленной реакции.');
+  if (incident.groups.includes('coordination')) attentions.push('Инцидент находится на координации и требует назначения профильной команды.');
+  if (incident.dueAt !== null && incident.dueAt !== undefined && incident.dueAt <= Date.now() + SLA_RISK_WINDOW_MS) {
+    attentions.push('Риск нарушения SLA: срок близок или уже истёк.');
+  }
+  if (incident.isNeedUp) attentions.push('Запись требует эскалации (isNeedUp).');
+  if (!attentions.length) attentions.push('Особых рисков не выявлено.');
+  const recommendation = incident.groups.includes('coordination')
+    ? 'Назначить профильную команду для обработки инцидента.'
+    : 'Контролировать SLA и динамику обращений.';
+  return { summary, attentions, recommendation };
+}
+
+async function routingSuggest(body) {
+  if (!routingEnabled) {
+    throw new HttpError('Маршрутизация отключена', 404, 'routing_disabled');
+  }
+  const caseId = nullableText(body.caseId);
+  if (!caseId) throw new HttpError('caseId обязателен', 400, 'invalid_case');
+  const incident = requiredCase(caseId);
+  if (!incident.groups.includes('active')) {
+    throw new HttpError('Подсказка доступна только для активного инцидента', 409, 'not_active');
+  }
+  if (incident.team) {
+    throw new HttpError('Команда уже назначена', 409, 'team_assigned');
+  }
+  const cacheKey = caseId + ':' + incident.version;
+  const cached = cachedRoutingResult(cacheKey);
+  if (cached) return cached;
+  const suggestion = await suggestTeam(ai, incident, { timeoutMs: routingTimeoutMs });
+  const result = {
+    caseId,
+    version: incident.version,
+    team: suggestion.team,
+    rationale: suggestion.rationale,
+    confidence: suggestion.confidence,
+    source: suggestion.source
+  };
+  rememberRoutingResult(cacheKey, result);
+  return result;
+}
+
+async function assistantParse(body) {
+  if (!assistantEnabled) {
+    throw new HttpError('Ассистент отключён', 404, 'assistant_disabled');
+  }
+  const text = nullableText(body.text);
+  if (!text) throw new HttpError('text обязателен', 400, 'invalid_text');
+  if (text.length > ASSISTANT_TEXT_MAX) {
+    throw new HttpError('text должен содержать не более ' + ASSISTANT_TEXT_MAX + ' символов', 400, 'invalid_text');
+  }
+  const cacheKey = crypto.createHash('sha256').update(text.toLocaleLowerCase('ru')).digest('hex');
+  const cached = cachedAssistantResult(cacheKey);
+  let parsed = cached;
+  if (!parsed) {
+    parsed = await askAssistant(ai, text, store.listCases());
+    rememberAssistantResult(cacheKey, parsed);
+  }
+  if (parsed.intent === 'clarify') {
+    return { intent: 'clarify', clarification: parsed.clarification, options: parsed.options || [] };
+  }
+  const matched = filterIncidents(store.listCases(), parsed.filter);
+  return {
+    intent: 'filter',
+    filter: matched.filter,
+    explanation: parsed.explanation,
+    confidence: parsed.confidence,
+    matched: {
+      count: matched.total,
+      active: matched.activeCount,
+      closed: matched.closedCount,
+      truncated: matched.truncated,
+      caseIds: matched.items.map(incident => incident.caseId)
+    }
+  };
+}
+
+async function aiSummary(body) {
+  const caseId = nullableText(body.caseId);
+  const incident = caseId ? requiredCase(caseId) : null;
+  const prompt = incident
+    ? buildIncidentPrompt(incident, store.listHistory(caseId))
+    : buildDashboardPrompt(dashboard());
+  try {
+    const result = await ai.summarize(prompt);
+    return { ...normalizeAiResult(result), fallback: false };
+  } catch (error) {
+    if (!aiFallback || !(error instanceof AiError)) throw error;
+    return {
+      ...(incident ? fallbackIncidentSummary(incident) : fallbackSummary()),
+      fallback: true,
+      reason: { code: error.code, message: error.message }
+    };
+  }
+}
+
+function metaPayload() {
+  return {
+    priorities: { ...PRIORITIES },
+    priorityLabels: { ...PRIORITY_TEXT },
+    states: { ...STATES },
+    transitions: STATUS_TRANSITIONS,
+    teams: MTS_TEAMS,
+    assistantEnabled,
+    routingEnabled
+  };
+}
+
+function decodePathId(value, label = 'id') {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    throw new HttpError(`Некорректный ${label}`, 400);
+  }
+}
+
+function userView(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    login: row.login,
+    role: row.role,
+    createdAt: row.createdAt,
+    sessionCount: row.sessionCount,
+    lastSessionAt: row.lastSessionAt === null || row.lastSessionAt === undefined ? null : row.lastSessionAt
+  };
+}
+
+function adminAudit(user, action, targetType, targetId, details = {}) {
+  store.recordAudit({ user, action, targetType, targetId, details });
+}
+
+async function mockReachable() {
+  try {
+    const response = await fetch(`${itsm.baseUrl}/health`, { signal: AbortSignal.timeout(1500) });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function handleApi(req, res, pathname, search = '') {
+  if (req.method === 'GET' && pathname === '/api/v1/health') {
+    sendJson(res, 200, { status: 'ok' });
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/auth/register') {
+    const session = await auth.register(await readJson(req));
+    sendJson(res, 201, { user: session.user }, { 'Set-Cookie': auth.sessionCookie(session.token) });
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/auth/login') {
+    const body = await readJson(req);
+    const now = Date.now();
+    const throttleKey = loginThrottleKey(req, body);
+    checkLoginRateLimit(throttleKey, now);
+    let session;
+    try {
+      session = await auth.login(body);
+    } catch (error) {
+      if (error instanceof AuthError && error.status === 401) recordLoginFailure(throttleKey, now);
+      throw error;
+    }
+    loginFailures.delete(throttleKey);
+    sendJson(res, 200, { user: session.user }, { 'Set-Cookie': auth.sessionCookie(session.token) });
+    return;
+  }
+
+  const session = requireUser(req);
+
+  if (req.method === 'GET' && pathname === '/api/v1/auth/me') {
+    sendJson(res, 200, { user: session.user });
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/auth/logout') {
+    auth.logout(session.token);
+    sendJson(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookie() });
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/api/v1/coordinators') {
+    sendJson(res, 200, { coordinators: store.listCoordinators() });
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/api/v1/meta') {
+    sendJson(res, 200, metaPayload());
+    return;
+  }
+
+  if (pathname === '/api/v1/admin/users' && req.method === 'GET') {
+    requireAdmin(session.user);
+    sendJson(res, 200, { users: store.listUsersWithSessions().map(userView) });
+    return;
+  }
+
+  const adminUserMatch = pathname.match(/^\/api\/v1\/admin\/users\/([^/]+)(\/role|\/logout)?$/);
+  if (adminUserMatch) {
+    requireAdmin(session.user);
+    const userId = decodePathId(adminUserMatch[1], 'userId');
+    const suffix = adminUserMatch[2] || '';
+    if (suffix === '' && req.method === 'DELETE') {
+      const result = await enqueue(async () => {
+        const target = store.getUserById(userId);
+        if (!target) throw new HttpError('Пользователь не найден', 404);
+        if (target.id === session.user.id) {
+          throw new HttpError('Нельзя удалить собственную учётную запись', 409);
+        }
+        if (target.role === 'admin' && store.countAdmins() <= 1) {
+          throw new HttpError('Нельзя удалить последнего администратора', 409);
+        }
+        const deleted = store.deleteUser(userId);
+        adminAudit(session.user, 'user.delete', 'user', userId, { login: deleted.login, role: deleted.role });
+        return {
+          ok: true,
+          deletedUser: { id: deleted.id, name: deleted.name, login: deleted.login, role: deleted.role }
+        };
+      });
+      sendJson(res, 200, result);
+      return;
+    }
+    if (suffix === '/role' && req.method === 'PATCH') {
+      const body = await readObject(req);
+      if (body.role !== 'admin' && body.role !== 'coordinator') {
+        throw new HttpError('role должен быть admin или coordinator', 400);
+      }
+      const result = await enqueue(async () => {
+        const target = store.getUserById(userId);
+        if (!target) throw new HttpError('Пользователь не найден', 404);
+        if (target.role === body.role) {
+          return { user: { id: target.id, name: target.name, login: target.login, role: target.role } };
+        }
+        if (target.role === 'admin' && body.role === 'coordinator' && store.countAdmins() <= 1) {
+          throw new HttpError('Нельзя лишить прав последнего администратора', 409);
+        }
+        const updated = store.setUserRole(userId, body.role);
+        adminAudit(session.user, 'user.role', 'user', userId, { from: target.role, to: updated.role });
+        return { user: { id: updated.id, name: updated.name, login: updated.login, role: updated.role } };
+      });
+      sendJson(res, 200, result);
+      return;
+    }
+    if (suffix === '/logout' && req.method === 'POST') {
+      const result = await enqueue(async () => {
+        const target = store.getUserById(userId);
+        if (!target) throw new HttpError('Пользователь не найден', 404);
+        const removedSessions = store.deleteUserSessions(userId);
+        adminAudit(session.user, 'user.logout', 'user', userId, { removedSessions });
+        return { ok: true, removedSessions };
+      });
+      sendJson(res, 200, result);
+      return;
+    }
+  }
+
+  if (pathname === '/api/v1/admin/system' && req.method === 'GET') {
+    requireAdmin(session.user);
+    const data = dashboard();
+    sendJson(res, 200, {
+      revision: store.getCurrentRevision(),
+      lastSyncedAt: data.lastSyncedAt,
+      syncError: data.syncError,
+      counts: data.counts,
+      users: store.countUsers(),
+      sessions: store.countSessions(Date.now()),
+      uptimeMs: Math.round(process.uptime() * 1000),
+      mockReachable: await mockReachable()
+    });
+    return;
+  }
+
+  if (pathname === '/api/v1/admin/demo/tick' && req.method === 'POST') {
+    requireAdmin(session.user);
+    sendJson(res, 200, await enqueue(async () => {
+      const demo = await itsm.demoTick();
+      const changes = await synchronize('admin-tick');
+      adminAudit(session.user, 'demo.tick', 'demo', null, demo);
+      return { added: changes.added, updated: changes.updated, revision: changes.revision, demo };
+    }));
+    return;
+  }
+
+  if (pathname === '/api/v1/admin/demo/critical' && req.method === 'POST') {
+    requireAdmin(session.user);
+    sendJson(res, 200, await enqueue(async () => {
+      const demo = await itsm.demoCritical();
+      const changes = await synchronize('admin-critical');
+      adminAudit(session.user, 'demo.critical', 'demo', null, demo);
+      return { added: changes.added, updated: changes.updated, revision: changes.revision, demo };
+    }));
+    return;
+  }
+
+  if (pathname === '/api/v1/admin/demo/reset' && req.method === 'POST') {
+    requireAdmin(session.user);
+    sendJson(res, 200, await enqueue(async () => {
+      await itsm.demoReset();
+      store.resetSyncState();
+      await synchronize('reset');
+      adminAudit(session.user, 'demo.reset', 'demo', null, {});
+      return { ok: true, revision: 0 };
+    }));
+    return;
+  }
+
+  if (pathname === '/api/v1/admin/audit' && req.method === 'GET') {
+    requireAdmin(session.user);
+    const params = new URLSearchParams(search);
+    const rawLimit = params.get('limit');
+    let limit = 50;
+    if (rawLimit !== null) {
+      if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 200) {
+        throw new HttpError('limit должен быть целым числом от 1 до 200', 400);
+      }
+      limit = Number(rawLimit);
+    }
+    sendJson(res, 200, { audit: store.listAudit(limit) });
+    return;
+  }
+
+  if (req.method === 'GET' && pathname === '/api/v1/events') {
+    openEvents(req, res);
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/api/v1/incidents') {
+    sendJson(res, 200, dashboard());
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/sync/itsm') {
+    sendJson(res, 200, await enqueue(async () => {
+      const changes = await synchronize('sync', demoGeneration);
+      adminAudit(session.user, 'sync.manual', 'sync', null, {
+        revision: changes.revision,
+        added: changes.added,
+        updated: changes.updated
+      });
+      return changes;
+    }));
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/ai/summary') {
+    enforceAiRateLimit(session.user);
+    sendJson(res, 200, await aiSummary(await readOptionalObject(req)));
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/assistant/parse') {
+    enforceAssistantRateLimit(session.user);
+    sendJson(res, 200, await assistantParse(await readObject(req)));
+    return;
+  }
+  if (req.method === 'POST' && pathname === '/api/v1/routing/suggest') {
+    enforceRoutingRateLimit(session.user);
+    sendJson(res, 200, await routingSuggest(await readObject(req)));
+    return;
+  }
+
+  const actionMatch = pathname.match(/^\/api\/v1\/incidents\/([^/]+)\/(claim|coordinator|priority|deadline|team|status|history)$/);
+  if (actionMatch) {
+    const caseId = decodeCaseId(actionMatch[1]);
+    const action = actionMatch[2];
+    if (action === 'history' && req.method === 'GET') {
+      requiredCase(caseId);
+      sendJson(res, 200, { history: store.listHistory(caseId) });
+      return;
+    }
+    if (action === 'claim' && req.method === 'POST') {
+      sendJson(res, 200, await claimCase(caseId, session.user, await readObject(req)));
+      return;
+    }
+    if (action === 'coordinator' && req.method === 'POST') {
+      sendJson(res, 200, await reassignCase(caseId, session.user, await readObject(req)));
+      return;
+    }
+    if (action === 'priority' && req.method === 'POST') {
+      sendJson(res, 200, await setPriority(caseId, session.user, await readObject(req)));
+      return;
+    }
+    if (action === 'deadline' && req.method === 'POST') {
+      sendJson(res, 200, await setDeadline(caseId, session.user, await readObject(req)));
+      return;
+    }
+    if (action === 'team' && req.method === 'POST') {
+      sendJson(res, 200, await setTeam(caseId, session.user, await readObject(req)));
+      return;
+    }
+    if (action === 'status' && req.method === 'POST') {
+      sendJson(res, 200, await setStatus(caseId, session.user, await readObject(req)));
+      return;
+    }
+  }
+
+  const overrideMatch = pathname.match(/^\/api\/v1\/incidents\/([^/]+)\/priority-override$/);
+  if (req.method === 'DELETE' && overrideMatch) {
+    sendJson(res, 200, await clearPriorityOverride(decodeCaseId(overrideMatch[1]), session.user));
+    return;
+  }
+
+  throw new HttpError('API endpoint не найден', 404);
+}
+
+function isInside(root, candidate) {
+  return candidate === root || candidate.startsWith(`${root}${path.sep}`);
+}
+
+function isSafeItsmPath(pathname) {
+  for (const segment of pathname.split('/')) {
+    let decoded;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      return false;
+    }
+    if (decoded.includes('\0') || decoded.includes('\\') || decoded === '..') return false;
+  }
+  return true;
+}
+
+async function proxyItsm(req, res, pathname, search) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError('Метод не поддерживается', 405);
+  if (!isSafeItsmPath(pathname)) throw new HttpError('Путь запрещён', 403);
+
+  let response;
+  try {
+    response = await fetch(`${itsm.baseUrl}${pathname}${search}`, {
+      method: req.method,
+      headers: { Accept: req.headers.accept || '*/*' },
+      signal: AbortSignal.timeout(itsmTimeoutMs)
+    });
+  } catch {
+    throw new HttpError('ITSM mock недоступен', 502);
+  }
+
+  const contentLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > MAX_JSON_BYTES) {
+    response.body?.cancel().catch(() => {});
+    throw new HttpError('Ответ ITSM превышает допустимый размер', 502);
+  }
+  const body = await response.arrayBuffer();
+  if (body.byteLength > MAX_JSON_BYTES) {
+    throw new HttpError('Ответ ITSM превышает допустимый размер', 502);
+  }
+
+  res.writeHead(response.status, {
+    'Content-Type': response.headers.get('content-type') || 'application/octet-stream',
+    'Content-Length': body.byteLength,
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
+  });
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  res.end(Buffer.from(body));
+}
+
+async function serveStatic(req, res, pathname) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError('Метод не поддерживается', 405);
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    throw new HttpError('Некорректный путь', 400);
+  }
+  if (decoded.includes('\0')) throw new HttpError('Некорректный путь', 400);
+  if (decoded === '/') decoded = '/index.html';
+  if (decoded.split('/').some(segment => segment.startsWith('.'))) {
+    throw new HttpError('Файл не найден', 404);
+  }
+
+  const root = await fs.promises.realpath(STATIC_DIR);
+  const candidate = path.resolve(root, `.${decoded}`);
+  if (!isInside(root, candidate)) throw new HttpError('Путь запрещён', 403);
+  let realPath;
+  let stat;
+  try {
+    realPath = await fs.promises.realpath(candidate);
+    if (!isInside(root, realPath)) throw new HttpError('Путь запрещён', 403);
+    stat = await fs.promises.stat(realPath);
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') throw new HttpError('Файл не найден', 404);
+    throw error;
+  }
+  if (!stat.isFile()) throw new HttpError('Файл не найден', 404);
+
+  const contentType = MIME_TYPES[path.extname(realPath).toLowerCase()] || 'application/octet-stream';
+  res.writeHead(200, {
+    'Content-Type': contentType,
+    'Content-Length': stat.size,
+    'Cache-Control': 'no-cache',
+    'X-Content-Type-Options': 'nosniff',
+    ...(contentType === MIME_TYPES['.html'] ? HTML_SECURITY_HEADERS : {})
+  });
+  if (req.method === 'HEAD') {
+    res.end();
+    return;
+  }
+  const stream = fs.createReadStream(realPath);
+  stream.once('error', () => res.destroy());
+  stream.pipe(res);
+}
+
+async function handleRequest(req, res) {
+  checkOrigin(req);
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(req.url, 'http://localhost');
+  } catch {
+    throw new HttpError('Некорректный URL', 400);
+  }
+  const pathname = parsedUrl.pathname;
+  if (pathname === '/api/v1' || pathname.startsWith('/api/v1/')) {
+    await handleApi(req, res, pathname, parsedUrl.search);
+    return;
+  }
+  if (pathname === '/itsm' || pathname.startsWith('/itsm/')) {
+    requireUser(req);
+    await proxyItsm(req, res, pathname, parsedUrl.search);
+    return;
+  }
+  await serveStatic(req, res, pathname);
+}
+
+const server = http.createServer((req, res) => {
+  handleRequest(req, res).catch(error => sendError(res, error));
+});
+server.on('clientError', (error, socket) => {
+  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+});
+
+function closeStore() {
+  if (!storeClosed) {
+    storeClosed = true;
+    store.close();
+  }
+}
+
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(pollTimer);
+  clearInterval(sessionCleanupTimer);
+  for (const client of eventClients) {
+    clearInterval(client.heartbeat);
+    client.res.end();
+  }
+  eventClients.clear();
+  const forceTimer = setTimeout(() => {
+    server.closeAllConnections();
+    closeStore();
+    process.exitCode = 1;
+  }, 5000);
+  forceTimer.unref();
+  server.close(() => {
+    clearTimeout(forceTimer);
+    operationTail.finally(closeStore);
+    process.exitCode = 0;
+  });
+  server.closeIdleConnections();
+}
+
+async function main() {
+  await enqueue(() => synchronize('startup')).catch(() => {});
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '0.0.0.0', resolve);
+  });
+  console.log(`Incident Pulse app listening on ${server.address().port}; ITSM mock: ${itsm.baseUrl}`);
+  pollTimer = setInterval(() => {
+    if (shuttingDown || pendingOperations > 0) return;
+    enqueue(() => synchronize('poll')).catch(() => {});
+  }, pollIntervalMs);
+  pollTimer.unref();
+  sessionCleanupTimer = setInterval(() => {
+    if (shuttingDown) return;
+    store.deleteExpiredSessions(Date.now());
+  }, 60 * 60 * 1000);
+  sessionCleanupTimer.unref();
+}
+
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);
+main().catch(error => {
+  console.error(error);
+  closeStore();
+  process.exitCode = 1;
+});

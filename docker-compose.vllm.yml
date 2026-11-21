@@ -1,0 +1,52 @@
+services:
+  model-init:
+    image: python:3.12-slim
+    profiles: ["vllm"]
+    restart: "no"
+    volumes:
+      - ./models:/models
+      - ./cache/huggingface:/cache/huggingface
+      - ./scripts/fetch-model.sh:/fetch-model.sh:ro
+    environment:
+      HF_HOME: /cache/huggingface
+      HF_TOKEN: "${HF_TOKEN:-}"
+      MODEL_SKIP_DOWNLOAD: "${MODEL_SKIP_DOWNLOAD:-0}"
+      VLLM_MODEL_ID: "${VLLM_MODEL_ID:-}"
+      VLLM_MODEL_NAME: "${VLLM_MODEL_NAME:-}"
+      VLLM_MODEL_FILE: "${VLLM_MODEL_FILE:-}"
+      VLLM_MODEL_REVISION: "${VLLM_MODEL_REVISION:-main}"
+    command: ["sh", "/fetch-model.sh"]
+
+  vllm:
+    profiles: ["vllm"]
+    depends_on:
+      model-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./models:/models:ro
+      - ./cache/huggingface:/cache/huggingface
+    environment:
+      HF_HOME: /cache/huggingface
+    command:
+      - --model
+      - /models/${VLLM_MODEL_NAME}
+      - --served-model-name
+      - "${AI_MODEL:-local}"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-4096}"
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.85}"
+    ports:
+      - "127.0.0.1:${VLLM_HOST_PORT:-8002}:8000"
+    restart: unless-stopped
+
+  app:
+    environment:
+      AI_BASE_URL: http://vllm:8000/v1
+      AI_MODEL: "${AI_MODEL:-local}"
+      AI_API_KEY: ""
+      AI_TIMEOUT_MS: "${AI_TIMEOUT_MS:-180000}"

@@ -1,0 +1,70 @@
+services:
+  itsm-mock:
+    build:
+      context: .
+      dockerfile: services/itsm-mock/Dockerfile
+    environment:
+      PORT: "3001"
+      DATA_DIR: /data
+    ports:
+      - "${MOCK_HOST_PORT:-8081}:3001"
+    volumes:
+      - mock-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3001/health').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  app:
+    build:
+      context: .
+      dockerfile: services/app/Dockerfile
+    environment:
+      PORT: "3000"
+      DATA_DIR: /data
+      STATIC_DIR: /web
+      ITSM_MOCK_URL: http://itsm-mock:3001
+      POLL_INTERVAL_MS: "2000"
+      COOKIE_SECURE: "false"
+      DEMO_GENERATION: "true"
+      AI_BASE_URL: "${AI_BASE_URL:-http://127.0.0.1:8000/v1}"
+      AI_MODEL: "${AI_MODEL:-qwen2.5-7b-awq}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_TIMEOUT_MS: "${AI_TIMEOUT_MS:-60000}"
+      AI_MAX_TOKENS: "${AI_MAX_TOKENS:-700}"
+      AI_FALLBACK: "${AI_FALLBACK:-true}"
+      AI_RATE_LIMIT_PER_MIN: "${AI_RATE_LIMIT_PER_MIN:-10}"
+      ASSISTANT_ENABLED: "${ASSISTANT_ENABLED:-true}"
+      ASSISTANT_RATE_LIMIT_PER_MIN: "${ASSISTANT_RATE_LIMIT_PER_MIN:-20}"
+      ROUTING_ENABLED: "${ROUTING_ENABLED:-true}"
+      ROUTING_RATE_LIMIT_PER_MIN: "${ROUTING_RATE_LIMIT_PER_MIN:-30}"
+      ROUTING_TIMEOUT_MS: "${ROUTING_TIMEOUT_MS:-20000}"
+      PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:-}"
+      SESSION_TTL_MS: "${SESSION_TTL_MS:-604800000}"
+    ports:
+      - "${APP_HOST_PORT:-8080}:3000"
+    volumes:
+      - app-data:/data
+    depends_on:
+      itsm-mock:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/v1/health').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  mock-data:
+  app-data:

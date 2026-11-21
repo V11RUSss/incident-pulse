@@ -1,0 +1,20 @@
+services:
+  vllm:
+    image: vllm/vllm-openai:latest
+    ipc: host
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "python3 -c \"import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status == 200 else 1)\""
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 900s

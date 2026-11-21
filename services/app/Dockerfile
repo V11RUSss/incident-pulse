@@ -1,0 +1,24 @@
+FROM node:24-alpine
+
+ENV NODE_ENV=production \
+    PORT=3000 \
+    DATA_DIR=/data \
+    STATIC_DIR=/web
+
+WORKDIR /app
+
+COPY services/app/package.json ./package.json
+COPY services/app/lib ./lib
+COPY services/app/src ./src
+COPY index.html app.js styles.css /web/
+COPY theme.js /web/
+
+RUN chmod -R a+rX /app /web \
+    && mkdir -p /data \
+    && chown node:node /data
+
+USER node
+
+EXPOSE 3000
+
+CMD ["node", "src/server.js"]
