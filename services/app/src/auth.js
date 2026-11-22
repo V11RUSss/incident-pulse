@@ -35,6 +35,9 @@ function validateCredentials(body, registration) {
   if (typeof body.password !== 'string' || !body.password.trim() || body.password.length > 1024) {
     throw new AuthError('password обязателен и должен содержать не более 1024 символов');
   }
+  if (registration && body.password.length < 8) {
+    throw new AuthError('password должен содержать не менее 8 символов');
+  }
   if (registration && (typeof body.name !== 'string' || !body.name.trim() || body.name.length > 200)) {
     throw new AuthError('name обязателен и должен содержать не более 200 символов');
   }

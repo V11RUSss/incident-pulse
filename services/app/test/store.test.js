@@ -109,6 +109,7 @@ test('empty delta at the current revision does not rebuild cases or bump version
     updated: 0,
     unchanged: 0,
     stale: 0,
+    rejected: [],
     revision: 3,
     lastSyncedAt: 123456,
     syncError: null
@@ -118,6 +119,55 @@ test('empty delta at the current revision does not rebuild cases or bump version
   assert.equal(store.getSyncState().lastSyncedAt, 123456);
   assert.equal(store.getSyncState().syncError, null);
   assert.equal(store.getCurrentRevision(), 3);
+});
+
+test('markUnreadAssignmentsForCase clears older duplicates for the same case', (t) => {
+  const store = tempStore(t);
+  store.createUser(user('u1', 1));
+  store.createNotification({
+    userId: 'u1', caseId: 'case-1', incidentId: 'INC-1', type: 'coordinator_assigned',
+    title: 'Назначение', message: 'first', createdAt: 1
+  });
+  store.createNotification({
+    userId: 'u1', caseId: 'case-1', incidentId: 'INC-1', type: 'coordinator_assigned',
+    title: 'Назначение', message: 'second', createdAt: 2
+  });
+  assert.equal(store.countUnreadNotifications('u1'), 2);
+  assert.equal(store.markUnreadAssignmentsForCase('u1', 'case-1'), 2);
+  assert.equal(store.countUnreadNotifications('u1'), 0);
+});
+
+test('applyDelta dead-letters malformed records without blocking valid ones', (t) => {
+  const store = tempStore(t);
+  const result = store.applyDelta([
+    raw({ id: 'BAD-1', stateId: 99 }),
+    raw({ id: 'GOOD-1', version: 1, affectedUsers: 20, correlationKey: 'good-1' })
+  ], 5);
+  assert.equal(result.rejected.length, 1);
+  assert.equal(result.rejected[0].id, 'BAD-1');
+  assert.match(result.syncError, /некорректных записей/);
+  assert.equal(result.added, 1);
+  assert.equal(store.getCurrentRevision(), 5);
+  assert.equal(store.listCases().length, 1);
+  assert.equal(store.listSyncFailures(5)[0].incidentId, 'BAD-1');
+  assert.equal(store.getSyncState().syncError, result.syncError);
+  const clean = store.applyDelta([raw({ id: 'GOOD-1', version: 2, affectedUsers: 25, correlationKey: 'good-1' })], 6);
+  assert.equal(clean.rejected.length, 0);
+  assert.equal(store.getSyncState().syncError, null);
+});
+
+test('backup writes a consistent snapshot file', (t) => {
+  const store = tempStore(t);
+  store.applyDelta([raw()], 1);
+  const file = store.backup('test');
+  assert.ok(fs.existsSync(file));
+  assert.ok(fs.statSync(file).size > 0);
+  const copy = new DatabaseSync(file, { readOnly: true });
+  try {
+    assert.equal(copy.prepare('SELECT COUNT(*) AS count FROM cases').get().count, 1);
+  } finally {
+    copy.close();
+  }
 });
 
 test('resetSyncState clears cases and history and accepts a fresh snapshot', (t) => {
@@ -145,7 +195,9 @@ test('resetSyncState clears cases and history and accepts a fresh snapshot', (t)
   assert.equal(store.listCases().length, 0);
   assert.equal(store.getCurrentRevision(), 0);
   assert.equal(store.listHistory(caseId).length, 0);
-  assert.equal(store.listNotifications('u1').length, 0);
+  const keptNotifications = store.listNotifications('u1');
+  assert.equal(keptNotifications.length, 1);
+  assert.ok(keptNotifications[0].readAt);
   const result = store.applyDelta([raw({ version: 2, affectedUsers: 600 })], 9);
   assert.equal(result.added, 1);
   assert.equal(store.getCurrentRevision(), 9);

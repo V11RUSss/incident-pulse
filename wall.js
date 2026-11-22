@@ -44,9 +44,11 @@
   const UNASSIGNED_LABEL = 'Без команды';
 
   const numberFormatter = new Intl.NumberFormat('ru-RU');
-  const hmFormatter = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit' });
-  const hmsFormatter = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  const dateFormatter = new Intl.DateTimeFormat('ru-RU', { weekday: 'short', day: 'numeric', month: 'short' });
+  const MOSCOW_TZ = 'Europe/Moscow';
+  const hmFormatter = new Intl.DateTimeFormat('ru-RU', { timeZone: MOSCOW_TZ, hour: '2-digit', minute: '2-digit' });
+  const hmsFormatter = new Intl.DateTimeFormat('ru-RU', { timeZone: MOSCOW_TZ, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  const dateFormatter = new Intl.DateTimeFormat('ru-RU', { timeZone: MOSCOW_TZ, weekday: 'short', day: 'numeric', month: 'short' });
+  const hourFormatter = new Intl.DateTimeFormat('ru-RU', { timeZone: MOSCOW_TZ, hour: '2-digit', hour12: false });
 
   const els = {};
   const state = {
@@ -284,9 +286,24 @@
     return timestampOf(item.startedAt) || timestampOf(item.submitDate);
   }
 
+  const ACTION_LABELS = {
+    claim: 'взятие в работу',
+    reassign: 'передача координатору',
+    priority: 'изменение приоритета',
+    'priority-override.delete': 'возврат к автоприоритету',
+    deadline: 'изменение срока SLA',
+    team: 'назначение команды',
+    status: 'изменение статуса',
+    merge: 'объединение кейсов',
+    correlation_key: 'изменение correlationKey'
+  };
+
   function changeAction(change) {
     if (!change || typeof change !== 'object') return 'изменение';
-    if (typeof change.action === 'string' && change.action.trim() !== '') return change.action.trim();
+    if (typeof change.action === 'string' && change.action.trim() !== '') {
+      const action = change.action.trim();
+      return ACTION_LABELS[action] || action;
+    }
     const bits = [];
     if (change.status) bits.push(String(change.status));
     if (change.priorityText) bits.push(String(change.priorityText));
@@ -379,7 +396,7 @@
       + '<div class="crit-meta">' + meta.join('') + '</div>'
       + (due !== null ? '<div class="sla-block">' + trackHtml(due, started) + '</div>' : '')
       + '</div>'
-      + '<div class="crit-timer">' + countdownHtml(due, started) + '<small>' + (due === null ? 'без SLA' : 'до SLA') + '</small></div>'
+      + '<div class="crit-timer">' + countdownHtml(due, started) + '<small class="sla-caption">' + (due === null ? 'без SLA' : (due < Date.now() ? 'просрочено' : 'до SLA')) + '</small></div>'
       + '</article>';
   }
 
@@ -710,6 +727,8 @@
       node.textContent = formatRemaining(remaining);
       node.classList.remove('is-ok', 'is-warn', 'is-critical', 'is-overdue');
       node.classList.add(toneForRemaining(remaining));
+      const caption = node.parentElement && node.parentElement.querySelector('.sla-caption');
+      if (caption) caption.textContent = remaining < 0 ? 'просрочено' : 'до SLA';
     }
     const tracks = document.querySelectorAll('.sla-track[data-due]');
     for (let index = 0; index < tracks.length; index += 1) {
@@ -754,7 +773,8 @@
         els.updateAge.classList.remove('is-stale', 'is-error');
       } else {
         const age = now - state.lastSuccessAt;
-        let text = 'обновлено ' + formatAge(age) + ' назад';
+        const ageText = formatAge(age);
+        let text = ageText === 'только что' ? 'обновлено только что' : 'обновлено ' + ageText + ' назад';
         if (state.lastSyncError) text += ' · ошибка синхронизации';
         els.updateAge.textContent = text;
         els.updateAge.classList.toggle('is-stale', age > 45000 && !state.lastSyncError);
@@ -1021,8 +1041,12 @@
 
   /* ---------------------------------------------------------------- clock */
 
+  function moscowHour(date) {
+    return Number(hourFormatter.format(date));
+  }
+
   function shiftLabel(date) {
-    const hours = date.getHours();
+    const hours = moscowHour(date);
     return hours >= 8 && hours < 20
       ? 'Дневная смена · 08:00–20:00'
       : 'Ночная смена · 20:00–08:00';
@@ -1030,9 +1054,7 @@
 
   function tickClock() {
     const now = new Date();
-    if (els.clock) {
-      els.clock.textContent = pad2(now.getHours()) + ':' + pad2(now.getMinutes()) + ':' + pad2(now.getSeconds());
-    }
+    if (els.clock) els.clock.textContent = hmsFormatter.format(now);
     if (els.clockDate) els.clockDate.textContent = dateFormatter.format(now);
     if (els.shiftLabel) els.shiftLabel.textContent = shiftLabel(now);
     updateCountdowns();

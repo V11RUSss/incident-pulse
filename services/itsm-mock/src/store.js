@@ -281,7 +281,7 @@ export class IncidentStore {
       const record = {
         id: `MTS-CRIT-${String(demoStep).padStart(4, '0')}`,
         correlationKey: `critical-manual-${demoStep}`,
-        header: 'Критический массовый инцидент (демонстрация)',
+        header: 'Массовый сбой облачных сервисов (ручная проверка)',
         description: 'Критический инцидент создан администратором через панель управления для проверки эскалации.',
         productName: 'МТС Cloud',
         service: 'Облачные виртуальные машины',

@@ -7,9 +7,24 @@ services:
       PORT: "3001"
       DATA_DIR: /data
     ports:
-      - "${MOCK_HOST_PORT:-8081}:3001"
+      - "${MOCK_BIND:-127.0.0.1}:${MOCK_HOST_PORT:-8081}:3001"
     volumes:
       - mock-data:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 256m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     healthcheck:
       test:
         - CMD
@@ -31,8 +46,11 @@ services:
       STATIC_DIR: /web
       ITSM_MOCK_URL: http://itsm-mock:3001
       POLL_INTERVAL_MS: "2000"
-      COOKIE_SECURE: "false"
-      DEMO_GENERATION: "true"
+      COOKIE_SECURE: "${COOKIE_SECURE:-false}"
+      DEMO_GENERATION: "${DEMO_GENERATION:-true}"
+      REGISTRATION_ENABLED: "${REGISTRATION_ENABLED:-false}"
+      REGISTRATION_TOKEN: "${REGISTRATION_TOKEN:-}"
+      MAX_SSE_CLIENTS: "${MAX_SSE_CLIENTS:-500}"
       DEMO_MIN_INTERVAL_MS: "${DEMO_MIN_INTERVAL_MS:-3000}"
       DEMO_MAX_INTERVAL_MS: "${DEMO_MAX_INTERVAL_MS:-9000}"
       DEMO_BATCH_MIN: "${DEMO_BATCH_MIN:-1}"
@@ -60,9 +78,24 @@ services:
       PUBLIC_ORIGIN: "${PUBLIC_ORIGIN:-}"
       SESSION_TTL_MS: "${SESSION_TTL_MS:-604800000}"
     ports:
-      - "${APP_HOST_PORT:-8080}:3000"
+      - "${APP_BIND:-0.0.0.0}:${APP_HOST_PORT:-8080}:3000"
     volumes:
       - app-data:/data
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       itsm-mock:
         condition: service_healthy
@@ -71,11 +104,11 @@ services:
         - CMD
         - node
         - -e
-        - "fetch('http://127.0.0.1:3000/api/v1/health').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));"
+        - "fetch('http://127.0.0.1:3000/api/v1/ready').then((response) => { if (!response.ok) process.exit(1); }).catch(() => process.exit(1));"
       interval: 5s
       timeout: 3s
       retries: 12
-      start_period: 5s
+      start_period: 10s
 
 volumes:
   mock-data:

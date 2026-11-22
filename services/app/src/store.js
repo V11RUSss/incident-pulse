@@ -12,7 +12,7 @@ const {
   incidentId,
   integer,
   nullableText,
-  validateRawBatch
+  validateRawIncident
 } = require('../lib/incidents');
 
 function sortedValue(value) {
@@ -120,8 +120,14 @@ function mergeRowView(row) {
 
 class Store {
   constructor(dataDir) {
-    fs.mkdirSync(dataDir, { recursive: true });
-    this.db = new DatabaseSync(path.join(dataDir, 'incident-pulse.sqlite'));
+    fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dataDir, 0o700); } catch { /* best effort on shared mounts */ }
+    this.dataDir = dataDir;
+    const dbPath = path.join(dataDir, 'incident-pulse.sqlite');
+    this.db = new DatabaseSync(dbPath);
+    for (const suffix of ['', '-wal', '-shm']) {
+      try { fs.chmodSync(dbPath + suffix, 0o600); } catch { /* best effort on shared mounts */ }
+    }
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA foreign_keys = ON;');
     this.db.exec('PRAGMA busy_timeout = 5000;');
@@ -240,6 +246,16 @@ class Store {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS case_key_aliases_case_idx ON case_key_aliases(case_id);
+
+      CREATE TABLE IF NOT EXISTS sync_failures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        incident_id TEXT,
+        revision INTEGER,
+        raw_json TEXT,
+        error TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS sync_failures_created_idx ON sync_failures(created_at DESC);
     `);
     this.ensureUserRoleColumn();
     this.ensureCaseTeamOverrideColumn();
@@ -347,6 +363,37 @@ class Store {
     `).run(user.id, user.name, action, targetType, targetId, JSON.stringify(details), createdAt);
   }
 
+  listSyncFailures(limit = 50) {
+    const bounded = Math.min(Math.max(Number.isInteger(limit) ? limit : 50, 1), 200);
+    return this.db.prepare(`
+      SELECT id, incident_id, revision, raw_json, error, created_at
+      FROM sync_failures ORDER BY id DESC LIMIT ?
+    `).all(bounded).map(row => ({
+      id: row.id,
+      incidentId: row.incident_id,
+      revision: row.revision,
+      raw: row.raw_json ? JSON.parse(row.raw_json) : null,
+      error: row.error,
+      createdAt: row.created_at
+    }));
+  }
+
+  backup(reason = 'manual', keep = 5) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const target = path.join(this.dataDir, `incident-pulse.backup-${stamp}-${reason}.sqlite`);
+    const escaped = target.replace(/'/g, "''");
+    this.db.exec(`VACUUM INTO '${escaped}';`);
+    try { fs.chmodSync(target, 0o600); } catch { /* best effort */ }
+    const backups = fs.readdirSync(this.dataDir)
+      .filter(name => name.startsWith('incident-pulse.backup-') && name.endsWith('.sqlite'))
+      .sort()
+      .reverse();
+    for (const name of backups.slice(keep)) {
+      try { fs.unlinkSync(path.join(this.dataDir, name)); } catch { /* best effort */ }
+    }
+    return target;
+  }
+
   listAudit(limit) {
     return this.db.prepare(`
       SELECT id, user_id, user_name, action, target_type, target_id, details_json, created_at
@@ -404,6 +451,15 @@ class Store {
     `).run(readAt, id, userId);
     if (!result.changes) return null;
     return this.getNotification(id);
+  }
+
+  markUnreadAssignmentsForCase(userId, caseId, readAt = Date.now()) {
+    if (!caseId) return 0;
+    const result = this.db.prepare(`
+      UPDATE notifications SET read_at = ?
+      WHERE user_id = ? AND case_id = ? AND type = 'coordinator_assigned' AND read_at IS NULL
+    `).run(readAt, userId, String(caseId));
+    return Number(result.changes);
   }
 
   markAllNotificationsRead(userId, readAt = Date.now()) {
@@ -661,7 +717,7 @@ class Store {
       }
       const targetKey = targetRow.correlation_key;
       this.db.prepare('UPDATE cases SET team_override = ? WHERE id = ?')
-        .run(target.team === null || target.team === undefined ? '' : String(target.team), targetCaseId);
+        .run(target.team === null || target.team === undefined ? null : String(target.team), targetCaseId);
 
       const insertMerge = this.db.prepare(`
         INSERT INTO case_merges (
@@ -897,9 +953,10 @@ class Store {
       this.db.exec('DELETE FROM case_merges;');
       this.db.exec('DELETE FROM raw_incidents;');
       this.db.exec('DELETE FROM cases;');
-      // Notifications point at cases that no longer exist after a reset or a
-      // full re-read; keeping them leaves dead items in the bell.
-      this.db.exec('DELETE FROM notifications;');
+      // Keep the notification history in the bell, but mark it read: the
+      // linked cases no longer exist, so unread counts would otherwise be
+      // permanently misleading.
+      this.db.prepare('UPDATE notifications SET read_at = COALESCE(read_at, ?)').run(Date.now());
       this.db.exec('DELETE FROM correlation_overrides;');
       this.db.exec('DELETE FROM case_key_aliases;');
       this.setMetadata('itsmRevision', '0');
@@ -912,7 +969,7 @@ class Store {
   }
 
   applyDelta(records, revision, syncedAt = Date.now()) {
-    validateRawBatch(records);
+    if (!Array.isArray(records)) throw new ValidationError('Ожидался массив raw-инцидентов');
     const currentRevision = this.getCurrentRevision();
     if (!Number.isSafeInteger(revision) || revision < currentRevision) {
       throw new ValidationError('ITSM revision должен быть неотрицательным и не может уменьшаться');
@@ -925,11 +982,35 @@ class Store {
         updated: 0,
         unchanged: 0,
         stale: 0,
+        rejected: [],
         revision,
         lastSyncedAt: syncedAt,
         syncError: null
       };
     }
+
+    // One malformed upstream record must not stop the whole feed forever. Keep
+    // valid records in the delta, acknowledge the revision, and dead-letter the
+    // rest for operators. The next successful sync clears the warning.
+    const validRecords = [];
+    const rejected = [];
+    const seenIds = new Set();
+    records.forEach((raw, index) => {
+      try {
+        validateRawIncident(raw, `incidents[${index}]`);
+        const id = incidentId(raw);
+        if (!id) throw new ValidationError(`incidents[${index}].id обязателен`);
+        if (seenIds.has(id)) throw new ValidationError(`Дублирующийся id в delta: ${id}`);
+        seenIds.add(id);
+        validRecords.push(raw);
+      } catch (error) {
+        const id = raw && raw.id !== null && raw.id !== undefined ? String(raw.id) : null;
+        rejected.push({
+          id,
+          error: error && error.message ? error.message : 'Некорректная запись ITSM'
+        });
+      }
+    });
 
     const before = new Map();
     for (const row of this.db.prepare('SELECT id, canonical_json FROM cases').all()) {
@@ -940,7 +1021,17 @@ class Store {
     let stale = 0;
     this.db.exec('BEGIN IMMEDIATE;');
     try {
-      for (const raw of records) {
+      if (rejected.length) {
+        const insertFailure = this.db.prepare(`
+          INSERT INTO sync_failures (incident_id, revision, raw_json, error, created_at)
+          VALUES (?, ?, ?, ?, ?)
+        `);
+        for (const failure of rejected) {
+          const raw = records.find(item => item && item.id !== null && item.id !== undefined && String(item.id) === failure.id);
+          insertFailure.run(failure.id, revision, raw ? serialize(raw) : null, failure.error, syncedAt);
+        }
+      }
+      for (const raw of validRecords) {
         const id = incidentId(raw);
         const version = integer(raw.version);
         const serialized = serialize(raw);
@@ -982,18 +1073,22 @@ class Store {
         else if (canonicalSignature(before.get(caseId)) !== canonicalSignature(canonical)) updated += 1;
       }
 
+      const syncError = rejected.length
+        ? `ITSM прислал ${rejected.length} некорректных записей; они отложены в sync_failures`
+        : null;
       this.setMetadata('itsmRevision', String(revision));
       this.setMetadata('lastSyncedAt', String(syncedAt));
-      this.setMetadata('syncError', null);
+      this.setMetadata('syncError', syncError);
       this.db.exec('COMMIT;');
       return {
         added,
         updated,
         unchanged,
         stale,
+        rejected,
         revision,
         lastSyncedAt: syncedAt,
-        syncError: null
+        syncError
       };
     } catch (error) {
       this.db.exec('ROLLBACK;');

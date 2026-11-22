@@ -12,7 +12,7 @@
   <script src="app.js" defer></script>
 </head>
 <body>
-  <a class="skip-link" id="skip-link" href="#dashboard-title" hidden>Перейти к инцидентам</a>
+  <a class="skip-link" id="skip-link" href="#dashboard-title">Перейти к инцидентам</a>
 
   <header class="topbar">
     <div class="brand" aria-label="МТС Инциденты">
@@ -59,7 +59,7 @@
           <span id="coordinator-display-name"></span>
           <small><span id="coordinator-login"></span><span class="role-badge" id="coordinator-role" hidden>админ</span></small>
         </span>
-        <button class="logout-button" id="logout-button" type="button">Выйти</button>
+        <button class="logout-button" id="logout-button" type="button" aria-label="Выйти"><svg class="icon logout-icon" aria-hidden="true"><use href="#i-power"></use></svg><span class="logout-label">Выйти</span></button>
       </div>
     </div>
   </header>
@@ -127,8 +127,8 @@
 
   <main class="main-content" id="dashboard-view" hidden>
     <nav class="workspace-tabs" role="tablist" aria-label="Рабочие вкладки">
-      <button class="workspace-tab is-active" id="workspace-tab-our" type="button" role="tab" aria-selected="true" aria-controls="workspace-pane-our" tabindex="0">Наша картина</button>
-      <button class="workspace-tab" id="workspace-tab-assigned" type="button" role="tab" aria-selected="false" aria-controls="workspace-pane-assigned" tabindex="-1">Назначенные мне</button>
+      <button class="workspace-tab is-active" id="workspace-tab-our" type="button" role="tab" aria-selected="true" aria-controls="workspace-pane-our" tabindex="0">Все инциденты</button>
+      <button class="workspace-tab" id="workspace-tab-assigned" type="button" role="tab" aria-selected="false" aria-controls="workspace-pane-assigned" tabindex="-1">Мои</button>
     </nav>
 
     <section class="workspace-pane" id="workspace-pane-our" role="tabpanel" aria-labelledby="workspace-tab-our">
@@ -191,10 +191,6 @@
       <span class="data-chip">
         <svg class="icon" aria-hidden="true"><use href="#i-users"></use></svg>
         Затронуто <strong id="affected-count">0</strong> пользователей
-      </span>
-      <span class="data-chip data-chip--muted">
-        <svg class="icon" aria-hidden="true"><use href="#i-refresh"></use></svg>
-        Обновлено <strong id="last-sync-label">—</strong>
       </span>
       <span class="data-chip data-chip--muted" id="archive-hint" hidden>
         <svg class="icon" aria-hidden="true"><use href="#i-box"></use></svg>
@@ -343,29 +339,16 @@
     <section class="workspace-pane assigned-pane" id="workspace-pane-assigned" role="tabpanel" aria-labelledby="workspace-tab-assigned" hidden>
       <header class="assigned-heading">
         <div>
-          <p class="eyebrow">Мои назначения</p>
-          <h2 id="assigned-title">Назначенные мне</h2>
+          <h2 id="assigned-title">Мои инциденты</h2>
           <p class="assigned-summary" id="assigned-summary"></p>
         </div>
       </header>
-      <p class="assigned-empty" id="assigned-empty" hidden>Вам пока не назначены инциденты.</p>
+      <p class="assigned-empty" id="assigned-empty" hidden>У вас пока нет назначенных инцидентов.</p>
       <ul class="assigned-list" id="assigned-list" role="list"></ul>
-
-      <section class="unaccepted-panel" id="unaccepted-panel" aria-labelledby="unaccepted-title">
-        <header class="unaccepted-header">
-          <div>
-            <p class="eyebrow">Не принятые</p>
-            <h3 id="unaccepted-title">Не принятые назначения <span class="unaccepted-count" id="unaccepted-count">0</span></h3>
-            <p class="unaccepted-hint">Новые назначения координатору. Примите уведомление, чтобы убрать его из списка, или откройте кейс.</p>
-          </div>
-        </header>
-        <p class="unaccepted-empty" id="unaccepted-empty" hidden>Непринятых назначений нет.</p>
-        <ul class="unaccepted-list" id="unaccepted-list" role="list"></ul>
-      </section>
     </section>
   </main>
 
-  <dialog class="incident-dialog" id="incident-dialog" aria-labelledby="dialog-title" closedby="any">
+  <dialog class="incident-dialog" id="incident-dialog" aria-labelledby="dialog-title">
     <div class="dialog-layout">
       <header class="dialog-topbar">
         <span class="dialog-id" id="dialog-id"></span>
@@ -421,6 +404,20 @@
             </form>
           </section>
 
+          <section class="action-section" id="section-status" aria-labelledby="status-actions-title">
+            <h3 id="status-actions-title">Жизненный цикл</h3>
+            <form id="status-form" class="action-form" data-action-form>
+              <label for="status-select">Следующий статус</label>
+              <select id="status-select" name="stateId" required></select>
+              <div class="solution-field" id="solution-field">
+                <label for="solution-input">Решение</label>
+                <textarea id="solution-input" name="solution" rows="3" placeholder="Что восстановлено и как"></textarea>
+              </div>
+              <button class="button button-resolve" type="submit">Применить статус</button>
+            </form>
+            <p class="action-hint" id="no-transitions" hidden>Допустимых переходов для этого статуса нет.</p>
+          </section>
+
           <section class="action-section" id="section-team" aria-labelledby="team-actions-title">
             <h3 id="team-actions-title">Команда</h3>
             <div class="routing-hint" id="routing-hint" aria-live="polite" hidden>
@@ -436,26 +433,11 @@
               </div>
             </div>
             <p class="routing-status" id="routing-status" role="status" hidden></p>
-            <p class="action-hint">После назначения инцидент переходит в работу и уходит с координации. Срок SLA считается от момента возникновения и не продлевается автоматически — изменить его можно в блоке «Срок SLA».</p>
             <form id="team-form" class="action-form" data-action-form>
               <label for="team-select">Команда МТС</label>
               <select id="team-select" name="team"></select>
               <button class="button button-secondary" type="submit">Назначить команду</button>
             </form>
-          </section>
-
-          <section class="action-section action-section--wide" id="section-status" aria-labelledby="status-actions-title">
-            <h3 id="status-actions-title">Жизненный цикл</h3>
-            <form id="status-form" class="action-form" data-action-form>
-              <label for="status-select">Следующий статус</label>
-              <select id="status-select" name="stateId" required></select>
-              <div class="solution-field" id="solution-field">
-                <label for="solution-input">Решение</label>
-                <textarea id="solution-input" name="solution" rows="3" placeholder="Что восстановлено и как"></textarea>
-              </div>
-              <button class="button button-resolve" type="submit">Применить статус</button>
-            </form>
-            <p class="action-hint" id="no-transitions" hidden>Допустимых переходов для этого статуса нет.</p>
           </section>
 
           <p class="readonly-note" id="readonly-note" hidden>Инцидент завершён и находится в архиве.</p>
@@ -637,18 +619,18 @@
     </div>
   </dialog>
 
-  <button class="assistant-fab" id="assistant-button" type="button" aria-controls="assistant-panel" aria-expanded="false" hidden>
+  <button class="assistant-fab" id="assistant-button" type="button" aria-controls="assistant-panel" aria-expanded="false" aria-label="ИИ-фильтр" hidden>
     <svg class="icon" aria-hidden="true"><use href="#i-sparkles"></use></svg>
-    <span>Спросить</span>
+    <span>ИИ-фильтр</span>
   </button>
 
   <aside class="assistant-panel" id="assistant-panel" aria-labelledby="assistant-title" hidden>
     <header class="assistant-header">
       <div>
-        <p class="eyebrow">ИИ-фильтр</p>
-        <h2 id="assistant-title">Спросить дашборд</h2>
+        <p class="eyebrow">Подбор по описанию</p>
+        <h2 id="assistant-title">ИИ-фильтр</h2>
       </div>
-      <button class="icon-button" id="assistant-close" type="button" aria-label="Закрыть ассистента">
+      <button class="icon-button" id="assistant-close" type="button" aria-label="Закрыть ИИ-фильтр">
         <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
       </button>
     </header>
@@ -663,7 +645,7 @@
     <form class="assistant-form" id="assistant-form">
       <label class="visually-hidden" for="assistant-input">Запрос к дашборду</label>
       <input id="assistant-input" type="text" maxlength="400" autocomplete="off" placeholder="Например: что горит по SLA в Московской области">
-      <button class="button button-primary" id="assistant-submit" type="submit">Спросить</button>
+      <button class="button button-primary" id="assistant-submit" type="submit">Подобрать</button>
     </form>
     <p class="assistant-hint">Модель не считает и не отдаёт инциденты. История запросов живёт только в этой вкладке.</p>
   </aside>

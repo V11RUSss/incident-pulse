@@ -16,3 +16,11 @@ fixtures
 **/.env.*
 models
 cache
+.review
+.review/**
+docs
+prototype
+README.md
+**/*.md
+services/*/test
+**/*.test.js

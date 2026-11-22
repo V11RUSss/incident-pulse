@@ -10,6 +10,7 @@ WORKDIR /app
 COPY services/app/package.json ./package.json
 COPY services/app/lib ./lib
 COPY services/app/src ./src
+COPY scripts/create-admin.js ./scripts/create-admin.js
 COPY index.html app.js styles.css /web/
 COPY wall.html wall.js wall.css /web/
 COPY theme.js /web/

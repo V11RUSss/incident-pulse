@@ -47,12 +47,12 @@ test('40 demo ticks keep ids unique, criticals regular and impact monotonic', ()
     }
   }
 
-  const criticalCreates = [...records.values()].filter((record) => record.id.startsWith('MTS-CRIT-'));
-  assert.ok(criticalCreates.length >= 2, 'expected several generated critical records');
-  assert.equal(new Set(criticalCreates.map((record) => record.id)).size, criticalCreates.length);
+  const placeholders = [...records.values()].filter((record) => record.header.includes('(демонстрация)'));
+  assert.equal(placeholders.length, 0, 'placeholder demo criticals must not be generated');
+  assert.ok([...records.values()].some((record) => record.affectedUsers >= 1000), 'expected critical escalation');
 });
 
-test('continuation criticals alternate between new incidents and escalations', () => {
+test('continuation critical steps escalate existing incidents instead of creating placeholders', () => {
   const records = new Map();
   const created = [];
   const escalated = [];
@@ -67,10 +67,10 @@ test('continuation criticals alternate between new incidents and escalations', (
     else escalated.push(demoStep);
   }
 
-  assert.ok(created.length > 0, 'expected at least one new critical incident');
-  assert.ok(escalated.length > 0, 'expected at least one escalated critical incident');
-  assert.equal(created[0], CONTINUATION_START);
-  assert.equal(escalated[0], CONTINUATION_START + CRITICAL_EVERY);
+  assert.equal(created.length, 0, 'critical steps must not create placeholder incidents');
+  assert.ok(escalated.length >= 2, 'expected critical escalations');
+  assert.equal(escalated[0], CONTINUATION_START);
+  assert.ok(![...records.values()].some((record) => record.header.includes('(демонстрация)')));
 });
 
 test('critical cadence constant stays at 12', () => {

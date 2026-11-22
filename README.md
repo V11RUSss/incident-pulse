@@ -48,10 +48,10 @@
 - healthcheck app: <http://localhost:8080/api/v1/health>;
 - healthcheck mock: <http://localhost:8081/health>.
 
-В интерфейсе координатора есть кнопка **«Спросить»** (или `Ctrl+K`): фраза
+В интерфейсе координатора есть кнопка **«ИИ-фильтр»** (или `Ctrl+K`): фраза
 на естественном языке превращается в фильтр дашборда. Модель только разбирает
 намерение, а сервер исполняет whitelisted-фильтр; подробнее — в разделе
-[«Спросить дашборд»](#спросить-дашборд).
+[«ИИ-фильтр»](#ии-фильтр).
 
 ## Ручной запуск через Docker Compose
 
@@ -103,7 +103,7 @@ docker compose down
 
 На новых named volumes mock начинает работу с ревизией `0` и пустым списком инцидентов. Дашборд не наполняется автоматически при старте.
 
-После входа нажмите **«Синхронизировать с ITSM»**. В Compose включено `DEMO_GENERATION=true`, поэтому этот запрос (пока не достигнут предел активных кейсов `DEMO_MAX_ACTIVE`):
+После входа нажмите **«Синхронизировать с ITSM»**. В Compose по умолчанию `DEMO_GENERATION=true` (переопределяется переменной окружения; в production задайте `false`), поэтому этот запрос (пока не достигнут предел активных кейсов `DEMO_MAX_ACTIVE`):
 
 1. вызывает `POST /itsm/demo/tick` на mock и создаёт следующий шаг сценария;
 2. получает изменившиеся записи по ревизии;
@@ -113,9 +113,16 @@ docker compose down
 
 ## Регистрация и вход
 
-Откройте <http://localhost:8080> и зарегистрируйте учётную запись. Предустановленного пользователя нет. Первый зарегистрированный пользователь получает роль `admin`, все последующие — `coordinator`. Администратор управляет пользователями и демонстрационными сценариями, координаторы работают с инцидентами. Если база создана до появления ролей, роль `admin` автоматически получает самый ранний по `created_at` пользователь, поэтому существующая установка не блокируется.
+Откройте <http://localhost:8080>. Самостоятельная регистрация по умолчанию выключена (`REGISTRATION_ENABLED=false`); создайте администратора одноразово:
 
-Те же операции через `curl` в bash:
+```bash
+ADMIN_PASSWORD='сильный-пароль' docker compose exec -T -e ADMIN_PASSWORD app \
+  node scripts/create-admin.js --login admin --name "Администратор"
+```
+
+Пароль должен содержать не менее 8 символов. После bootstrap администратор добавляет координаторов через админ-панель или одноразовые учётные записи.
+
+Те же операции через `curl` в bash (пример для локальной демонстрации: включите `REGISTRATION_ENABLED=true` и замените пароль):
 
 ```bash
 COOKIE_JAR="$(mktemp)"
@@ -124,7 +131,7 @@ curl --fail-with-body --silent --show-error \
   --request POST \
   --cookie-jar "$COOKIE_JAR" \
   --header 'Content-Type: application/json' \
-  --data '{"name":"Дежурный координатор","login":"coordinator","password":"incident-pulse-demo-password"}' \
+  --data '{"name":"Дежурный координатор","login":"coordinator","password":"replace-with-strong-password"}' \
   http://localhost:8080/api/v1/auth/register
 
 curl --fail-with-body --silent --show-error \
@@ -132,7 +139,7 @@ curl --fail-with-body --silent --show-error \
   --cookie "$COOKIE_JAR" \
   --cookie-jar "$COOKIE_JAR" \
   --header 'Content-Type: application/json' \
-  --data '{"login":"coordinator","password":"incident-pulse-demo-password"}' \
+  --data '{"login":"coordinator","password":"replace-with-strong-password"}' \
   http://localhost:8080/api/v1/auth/login
 
 curl --fail-with-body --silent --show-error \
@@ -140,7 +147,7 @@ curl --fail-with-body --silent --show-error \
   http://localhost:8080/api/v1/auth/me
 ```
 
-При повторной регистрации того же `login` используйте другой логин или выполните только вход. Сессия хранится в SQLite; cookie имеет `HttpOnly` и `SameSite=Lax`. Для локального HTTP задано `COOKIE_SECURE=false`, а при HTTPS можно включить `COOKIE_SECURE=true`.
+При повторной регистрации того же `login` используйте другой логин или выполните только вход. Сессия хранится в SQLite; cookie имеет `HttpOnly` и `SameSite=Lax`. Для локального HTTP задано `COOKIE_SECURE=false`; при HTTPS в `.env` задайте `COOKIE_SECURE=true` (compose больше не фиксирует `false`) и `PUBLIC_ORIGIN=https://ваш-домен`.
 
 Вход защищён от перебора: после 10 неудачных попыток для пары IP + нормализованный `login` в течение 5 минут возвращается `429` с `{"error":"Слишком много попыток входа; повторите позже","code":"rate_limited"}`. Успешный вход сбрасывает счётчик; лимит применяется только к `POST /api/v1/auth/login`.
 
@@ -201,7 +208,7 @@ App формирует canonical case по следующим правилам:
 - выбор хранится в `localStorage` (`incident-pulse-live`);
 - ошибка SSE показывает «Нет связи», но не сбрасывает выбор.
 
-В эмуляторе `DEMO_GENERATION=true` при активном SSE (Live ON) app каждые 3–9 секунд запускает 1–3 шага mock-генератора (`DEMO_MIN_INTERVAL_MS`/`DEMO_MAX_INTERVAL_MS`, `DEMO_BATCH_MIN`/`DEMO_BATCH_MAX`), затем синхронизируется и рассылает SSE. Интервалы и размер пачки случайные, поэтому инциденты приходят неравномерно. Размер пачки ограничен оставшимися слотами `DEMO_MAX_ACTIVE` (по умолчанию 20), поэтому активных кейсов не может стать больше лимита. Живой клиент отключился — оставшиеся тики пачки не выполняются. Ручная синхронизация при Live OFF делает ровно один тик. Генератор **не назначает команды и не переводит кейсы в работу** — это делает только координатор. Критические инциденты создаются реже: не чаще одного continuation-шага из двенадцати; по умолчанию остаётся один стартовый критический пример.
+В эмуляторе `DEMO_GENERATION=true` при активном SSE (Live ON) app каждые 3–9 секунд запускает 1–3 шага mock-генератора (`DEMO_MIN_INTERVAL_MS`/`DEMO_MAX_INTERVAL_MS`, `DEMO_BATCH_MIN`/`DEMO_BATCH_MAX`), затем синхронизируется и рассылает SSE. Интервалы и размер пачки случайные, поэтому инциденты приходят неравномерно. Размер пачки ограничен оставшимися слотами `DEMO_MAX_ACTIVE` (по умолчанию 20), поэтому активных кейсов не может стать больше лимита. Живой клиент отключился — оставшиеся тики пачки не выполняются. Ручная синхронизация при Live OFF делает ровно один тик. Генератор **не назначает команды и не переводит кейсы в работу** — это делает только координатор. Критические шаги идут реже (раз в двенадцать continuation-шагов) и не создают отдельную «демонстрационную» карточку: они эскалируют существующий активный инцидент до критического (растёт число затронутых, isNeedUp).
 SSE раздаёт изменения браузеру. Это near-real-time, а не webhook от SimpleOne;
 для настоящего push нужен отдельный webhook, но для демо достаточно polling + SSE.
 
@@ -220,10 +227,10 @@ SSE раздаёт изменения браузеру. Это near-real-time, �
 
 Под авторизацией остаются две верхние вкладки:
 
-- **«Наша картина»** — существующий дашборд без изменений;
-- **«Назначенные мне»** — только кейсы с `coordinatorId = текущий пользователь`, с явным ID, приоритетом, командой, статусом, SLA и временем обновления.
+- **«Все инциденты»** — общий дашборд по всем кейсам;
+- **«Мои»** — только кейсы с `coordinatorId = текущий пользователь`, с явным ID, приоритетом, командой, статусом, SLA и временем обновления.
 
-Внизу личной вкладки — «Не принятые назначения» из unread `coordinator_assigned` уведомлений: текст инструкции, «Принять» (существующий read API) и «Открыть кейс». После принятия уведомление уходит из списка.
+Отдельного списка «не принятые» нет: уведомления о назначении приходят в колокольчик, сохраняются там в истории (прочитанные и непрочитанные) и открывают кейс. Счётчик на колокольчике показывает только непрочитанные.
 
 ## Действия координатора и lifecycle
 
@@ -532,9 +539,9 @@ AI вызывается только по запросу `POST /api/v1/ai/summar
 docker compose config --no-interpolate >/dev/null
 ```
 
-### Спросить дашборд
+### ИИ-фильтр
 
-Кнопка **«Спросить»** справа снизу (или `Ctrl+K` / `Cmd+K`) открывает
+Кнопка **«ИИ-фильтр»** справа снизу (или `Ctrl+K` / `Cmd+K`) открывает
 немодальную панель. Пользователь пишет фразу, модель превращает её в
 JSON-фильтр, а сервер исполняет фильтр обычным кодом.
 
@@ -746,7 +753,7 @@ Demo-генератор останавливает создание при DEMO_
 
 ## Тесты
 
-Тесты используют только встроенный `node:test` и временные каталоги ОС; серверы не запускаются, зависимости не нужны:
+Тесты используют только встроенный `node:test` и временные каталоги ОС; часть HTTP-тестов сама поднимает app/mock на ephemeral-портах (`PORT=0`), внешняя сеть и npm-зависимости не нужны:
 
 ```bash
 cd services/app && npm test
@@ -793,7 +800,35 @@ rm -f "$COOKIE_JAR"
 
 | Сервис | Контейнер / хост | Основные настройки |
 | --- | --- | --- |
-| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true`, `AI_BASE_URL=https://api.deepseek.com`, `AI_MODEL=deepseek-chat`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `TRIAGE_ENABLED=true`, `TRIAGE_AI_ENABLED=true`, `TRIAGE_AI_RATE_LIMIT_PER_MIN=10`, `TRIAGE_AI_TIMEOUT_MS=20000`, `DEMO_MIN_INTERVAL_MS=3000`, `DEMO_MAX_INTERVAL_MS=9000`, `DEMO_BATCH_MIN=1`, `DEMO_BATCH_MAX=3`, `DEMO_MAX_ACTIVE=20`, `PUBLIC_ORIGIN=`, `SESSION_TTL_MS=604800000` |
-| `itsm-mock` | `3001 / 8081` | `DATA_DIR=/data`, пустое начальное состояние на новом volume |
+| `itsm-mock` | `3001 / 8081` | `DATA_DIR=/data`, пустое начальное состояние на новом volume; порт по умолчанию публикуется только на `127.0.0.1` (`MOCK_BIND`), наружу не выставляйте. |
+| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true` (override), `AI_BASE_URL=http://127.0.0.1:8000/v1`, `AI_MODEL=qwen2.5-7b-awq`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `TRIAGE_ENABLED=true`, `TRIAGE_AI_ENABLED=true`, `TRIAGE_AI_RATE_LIMIT_PER_MIN=10`, `TRIAGE_AI_TIMEOUT_MS=20000`, `DEMO_MIN_INTERVAL_MS=3000`, `DEMO_MAX_INTERVAL_MS=9000`, `DEMO_BATCH_MIN=1`, `DEMO_BATCH_MAX=3`, `DEMO_MAX_ACTIVE=20`, `REGISTRATION_ENABLED=true` (override), `PUBLIC_ORIGIN=`, `COOKIE_SECURE=false` (override), `SESSION_TTL_MS=604800000` |
 
 `app` и `itsm-mock` собираются из корневого build context; локальный vLLM поднимается отдельными `docker-compose.vllm*.yml` только в `--mode=vllm`. `app` стартует после успешного healthcheck mock через `depends_on` с `service_healthy`; недоступный AI-бэкенд не блокирует запуск и уходит в AI-fallback.
+
+## Production
+
+Чек-лист выпуска, TLS/reverse proxy, bootstrap администратора, отключение
+демо-режима и открытой регистрации, backup/restore SQLite и mock, upgrade и
+rollback, мониторинг — в [docs/production.md](docs/production.md).
+
+Коротко: не публикуйте `itsm-mock` наружу, поставьте TLS-прокси перед app,
+задайте `PUBLIC_ORIGIN` и `COOKIE_SECURE=true`, выключите
+`DEMO_GENERATION` и `REGISTRATION_ENABLED`, создайте администратора
+через `scripts/create-admin.js`, настройте backup volumes и healthcheck на
+`/api/v1/ready`.
+
+### Прямая ссылка на кейс
+
+Чтобы сразу открыть карточку инцидента (например, для демонстрации
+переназначения), используйте query-параметр `case` с кодом или caseId:
+
+```text
+http://localhost:8080/?case=MTS-MOBILE-0001
+http://localhost:8080/?case=<caseId>
+http://localhost:8080/?view=assigned
+```
+
+После входа карточка откроется автоматически. В блоке «Координатор»
+выберите получателя и нажмите «Переназначить»; в блоке «Команда МТС» —
+команду и «Назначить команду». Ссылка работает и после логина, если
+открыть её неавторизованным.

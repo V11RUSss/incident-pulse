@@ -1,5 +1,8 @@
 'use strict';
 
+// Keep SQLite/WAL and any backup files private to the app user.
+process.umask(0o077);
+
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -28,6 +31,9 @@ const {
 const { MTS_TEAMS, STATUS_TRANSITIONS } = require('../lib/meta');
 
 const REPOSITORY_ROOT = path.resolve(__dirname, '../../..');
+if (process.env.NODE_ENV === 'production' && !process.env.STATIC_DIR) {
+  throw new Error('STATIC_DIR обязателен в production: не раздавайте корень репозитория');
+}
 const STATIC_DIR = path.resolve(process.env.STATIC_DIR || REPOSITORY_ROOT);
 const DATA_DIR = path.resolve(process.env.DATA_DIR || path.join(REPOSITORY_ROOT, '.data'));
 const MAX_JSON_BYTES = 5 * 1024 * 1024;
@@ -49,12 +55,17 @@ const MIME_TYPES = Object.freeze({
   '.woff2': 'font/woff2'
 });
 const HTML_SECURITY_HEADERS = Object.freeze({
-  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+  'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'",
   'X-Frame-Options': 'DENY',
-  'Referrer-Policy': 'no-referrer'
+  'Referrer-Policy': 'no-referrer',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+  'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
 });
 
 function configuredInteger(value, fallback, minimum = 1) {
+  if (value === undefined || value === null || String(value).trim() === '') return fallback;
   const converted = Number(value);
   return Number.isInteger(converted) && converted >= minimum ? converted : fallback;
 }
@@ -89,7 +100,11 @@ const triageEnabled = process.env.TRIAGE_ENABLED !== 'false';
 const triageAiEnabled = process.env.TRIAGE_AI_ENABLED !== 'false';
 const triageRateLimitPerMinute = configuredInteger(process.env.TRIAGE_AI_RATE_LIMIT_PER_MIN, 10, 0);
 const triageTimeoutMs = configuredInteger(process.env.TRIAGE_AI_TIMEOUT_MS, 20000, 1000);
+const registrationEnabled = process.env.REGISTRATION_ENABLED !== 'false';
+const registrationToken = String(process.env.REGISTRATION_TOKEN || '').trim();
 const publicOrigin = String(process.env.PUBLIC_ORIGIN || '').trim().replace(/\/+$/, '');
+const APP_VERSION = require('../package.json').version;
+const MAX_SSE_CLIENTS = configuredInteger(process.env.MAX_SSE_CLIENTS, 500, 1);
 const AI_RATE_WINDOW_MS = 60 * 1000;
 const ASSISTANT_CACHE_TTL_MS = 10 * 60 * 1000;
 const ASSISTANT_CACHE_MAX = 200;
@@ -110,6 +125,9 @@ const postmortemUsage = new Map();
 const postmortemCache = new Map();
 const triageUsage = new Map();
 const loginFailures = new Map();
+const registerUsage = new Map();
+const REGISTER_LIMIT = 20;
+const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 const store = new Store(DATA_DIR);
 const auth = new Auth(store);
 const ai = new AiClient();
@@ -235,6 +253,10 @@ function checkOrigin(req) {
     throw new HttpError('Origin не совпадает с origin запроса', 403);
   }
   if (actual !== expected) throw new HttpError('Origin не совпадает с origin запроса', 403);
+}
+
+function sessionTokenHash(token) {
+  return token ? crypto.createHash('sha256').update(token).digest('hex') : null;
 }
 
 function requireUser(req) {
@@ -388,6 +410,17 @@ function checkLoginRateLimit(key, now) {
   }
 }
 
+function checkRegisterRateLimit(req, now) {
+  const key = req.socket.remoteAddress || 'unknown';
+  const timestamps = (registerUsage.get(key) || []).filter(timestamp => timestamp > now - REGISTER_WINDOW_MS);
+  if (timestamps.length >= REGISTER_LIMIT) {
+    throw new HttpError('Слишком много регистраций с этого адреса; повторите позже', 429, 'rate_limited');
+  }
+  timestamps.push(now);
+  registerUsage.set(key, timestamps);
+  if (registerUsage.size > 5000) registerUsage.delete(registerUsage.keys().next().value);
+}
+
 function recordLoginFailure(key, now) {
   const timestamps = recentLoginFailures(key, now);
   timestamps.push(now);
@@ -397,7 +430,10 @@ function recordLoginFailure(key, now) {
   }
 }
 
-function openEvents(req, res, userId = null) {
+function openEvents(req, res, userId = null, tokenHash = null) {
+  if (eventClients.size >= MAX_SSE_CLIENTS) {
+    throw new HttpError('Слишком много открытых потоков; повторите позже', 503, 'too_many_streams');
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -406,7 +442,12 @@ function openEvents(req, res, userId = null) {
     'X-Content-Type-Options': 'nosniff'
   });
   res.write('retry: 3000\n: connected\n\n');
-  const client = { res, heartbeat: null, userId: userId === null ? null : String(userId) };
+  const client = {
+    res,
+    heartbeat: null,
+    userId: userId === null ? null : String(userId),
+    tokenHash: tokenHash || null
+  };
   const cleanup = () => {
     if (!eventClients.has(client)) return;
     clearInterval(client.heartbeat);
@@ -423,6 +464,9 @@ function openEvents(req, res, userId = null) {
 // The public wall has its own subscriber set: it must never enable or count
 // toward coordinator Live demo generation.
 function openWallEvents(req, res) {
+  if (wallEventClients.size >= MAX_SSE_CLIENTS) {
+    throw new HttpError('Слишком много открытых потоков; повторите позже', 503, 'too_many_streams');
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -453,9 +497,23 @@ function openWallEvents(req, res) {
 function writeEvent(client, event, data) {
   if (client.res.destroyed) return;
   try {
+    // Drop hopeless consumers instead of buffering the whole dashboard in memory.
+    if (client.res.writableLength > 1024 * 1024) {
+      client.res.destroy();
+      return;
+    }
     client.res.write(`event: ${event}\ndata: ${data}\n\n`);
   } catch {
     client.res.destroy();
+  }
+}
+
+function closeEventClients(predicate) {
+  for (const client of eventClients) {
+    if (!predicate(client)) continue;
+    clearInterval(client.heartbeat);
+    eventClients.delete(client);
+    try { client.res.end(); } catch { client.res.destroy(); }
   }
 }
 
@@ -489,6 +547,9 @@ function broadcastNotification(userId, notification, unread) {
 function notifyCoordinatorAssignment(incident, coordinator, actor) {
   if (!incident || !coordinator || coordinator.id === actor.id) return null;
   try {
+    // Reassigning the same case repeatedly must not pile up duplicate unread
+    // "you were assigned" items for the recipient.
+    store.markUnreadAssignmentsForCase(coordinator.id, incident.caseId);
     const notification = store.createNotification({
       userId: coordinator.id,
       caseId: incident.caseId,
@@ -511,8 +572,13 @@ async function loadDelta() {
     return { delta: await itsm.getChanges(store.getCurrentRevision()), reset: false };
   } catch (error) {
     if (!(error instanceof ItsmError) || error.code !== 'revision_ahead') throw error;
+    try {
+      const backup = store.backup('itsm-revision-reset');
+      console.warn(`ITSM revision опережает локальную; сделан backup ${backup}; локальное состояние перечитывается`);
+    } catch (backupError) {
+      console.error('Не удалось создать backup перед перечитыванием состояния ITSM', backupError);
+    }
     store.resetSyncState();
-    console.warn('ITSM revision опережает локальную; состояние синхронизации сброшено, выполняется полная перезагрузка');
     return { delta: await itsm.getChanges(0), reset: true };
   }
 }
@@ -539,6 +605,9 @@ async function synchronize(source, generate = false) {
       broadcastSync({ type: 'sync.recovered', lastSyncedAt: changes.lastSyncedAt, reset: true });
     } else if (previousSyncError !== null) {
       broadcastSync({ type: 'sync.recovered', lastSyncedAt: changes.lastSyncedAt });
+    }
+    if (Array.isArray(changes.rejected) && changes.rejected.length) {
+      broadcastSync({ type: 'sync.warning', error: changes.syncError, rejected: changes.rejected });
     }
     broadcastIncidents({ ...changes, source });
     return { ...changes, ...(demo ? { demo } : {}) };
@@ -689,6 +758,12 @@ async function claimCase(caseId, user, body) {
   return enqueue(async () => {
     const current = requiredCase(caseId);
     checkExpectedVersion(body, current);
+    if (current.groups.includes('closed')) {
+      throw new HttpError('Нельзя взять в работу закрытый инцидент', 409, 'case_closed');
+    }
+    if (current.coordinatorId && current.coordinatorId !== user.id) {
+      throw new HttpError('Инцидент уже назначен другому координатору', 409, 'already_assigned');
+    }
     if (current.coordinatorId === user.id) return { incident: current };
     await itsm.bulkUpdate(current.sourceIds, { coordinatorId: user.id, coordinatorName: user.name });
     await synchronize('claim');
@@ -736,6 +811,9 @@ async function setPriority(caseId, user, body) {
   return enqueue(async () => {
     const current = requiredCase(caseId);
     checkOptionalExpectedVersion(body, current);
+    if (current.groups.includes('closed')) {
+      throw new HttpError('Нельзя менять приоритет закрытого инцидента', 409, 'case_closed');
+    }
     if (current.priorityOverrideId === priorityId) return { incident: current };
     await itsm.bulkUpdate(current.sourceIds, { priorityOverrideId: priorityId });
     store.setPriorityOverride(caseId, priorityId);
@@ -753,6 +831,9 @@ async function setPriority(caseId, user, body) {
 async function clearPriorityOverride(caseId, user) {
   return enqueue(async () => {
     const current = requiredCase(caseId);
+    if (current.groups.includes('closed')) {
+      throw new HttpError('Нельзя менять приоритет закрытого инцидента', 409, 'case_closed');
+    }
     if (current.priorityOverrideId === null) return { incident: current };
     await itsm.bulkUpdate(current.sourceIds, { priorityOverrideId: null });
     store.setPriorityOverride(caseId, null);
@@ -772,10 +853,16 @@ async function setDeadline(caseId, user, body) {
     throw new HttpError('deadline должен содержать корректную дату или null', 400);
   }
   const deadlineMs = body.deadline === undefined ? null : parseTimestamp(body.deadline);
+  if (deadlineMs !== null && Math.abs(deadlineMs) > 8.64e15) {
+    throw new HttpError('deadline выходит за допустимый диапазон дат', 400);
+  }
   const deadline = deadlineMs === null ? null : new Date(deadlineMs).toISOString();
   return enqueue(async () => {
     const current = requiredCase(caseId);
     checkOptionalExpectedVersion(body, current);
+    if (current.groups.includes('closed')) {
+      throw new HttpError('Нельзя менять срок закрытого инцидента', 409, 'case_closed');
+    }
     if (current.dueAt === deadlineMs) return { incident: current };
     await itsm.bulkUpdate(current.sourceIds, { deadline });
     await synchronize('deadline');
@@ -787,6 +874,9 @@ async function setDeadline(caseId, user, body) {
 async function setTeam(caseId, user, body) {
   const team = nullableText(body.team);
   if (!team || team.length > 200) throw new HttpError('team обязателен и должен содержать не более 200 символов', 400);
+  if (!MTS_TEAMS.includes(team)) {
+    throw new HttpError('team должен быть одной из команд МТС из справочника', 400, 'unknown_team');
+  }
   return enqueue(async () => {
     const current = requiredCase(caseId);
     checkOptionalExpectedVersion(body, current);
@@ -1333,7 +1423,8 @@ function metaPayload() {
     routingEnabled,
     postmortemEnabled,
     triageEnabled,
-    triageAiEnabled
+    triageAiEnabled,
+    registrationEnabled
   };
 }
 
@@ -1372,11 +1463,44 @@ async function mockReachable() {
 
 async function handleApi(req, res, pathname, search = '') {
   if (req.method === 'GET' && pathname === '/api/v1/health') {
-    sendJson(res, 200, { status: 'ok' });
+    sendJson(res, 200, {
+      status: 'ok',
+      version: APP_VERSION,
+      uptimeMs: Math.round(process.uptime() * 1000)
+    });
+    return;
+  }
+  if (req.method === 'GET' && pathname === '/api/v1/ready') {
+    const sync = store.getSyncState();
+    try {
+      store.db.prepare('SELECT 1 AS ok').get();
+      sendJson(res, 200, {
+        status: 'ok',
+        version: APP_VERSION,
+        db: 'ok',
+        sync,
+        uptimeMs: Math.round(process.uptime() * 1000)
+      });
+    } catch (error) {
+      sendJson(res, 503, {
+        status: 'error',
+        version: APP_VERSION,
+        db: 'unavailable',
+        error: error.message
+      });
+    }
     return;
   }
   if (req.method === 'POST' && pathname === '/api/v1/auth/register') {
-    const session = await auth.register(await readJson(req));
+    if (!registrationEnabled) {
+      throw new HttpError('Самостоятельная регистрация отключена', 403, 'registration_disabled');
+    }
+    const body = await readJson(req);
+    if (registrationToken && String(body.registrationToken || '') !== registrationToken) {
+      throw new HttpError('Неверный код регистрации', 403, 'invalid_registration_token');
+    }
+    checkRegisterRateLimit(req, Date.now());
+    const session = await auth.register(body);
     sendJson(res, 201, { user: session.user }, { 'Set-Cookie': auth.sessionCookie(session.token) });
     return;
   }
@@ -1397,6 +1521,14 @@ async function handleApi(req, res, pathname, search = '') {
     return;
   }
 
+  if (req.method === 'GET' && pathname === '/api/v1/auth/config') {
+    sendJson(res, 200, {
+      registrationEnabled,
+      registrationTokenRequired: Boolean(registrationToken)
+    });
+    return;
+  }
+
   if (req.method === 'GET' && pathname === '/api/v1/wallboard') {
     sendJson(res, 200, wallboardPayload());
     return;
@@ -1410,6 +1542,7 @@ async function handleApi(req, res, pathname, search = '') {
   }
   if (req.method === 'POST' && pathname === '/api/v1/auth/logout') {
     auth.logout(session.token);
+    if (session.token) closeEventClients(client => client.tokenHash === sessionTokenHash(session.token));
     sendJson(res, 200, { ok: true }, { 'Set-Cookie': auth.clearCookie() });
     return;
   }
@@ -1444,6 +1577,7 @@ async function handleApi(req, res, pathname, search = '') {
           throw new HttpError('Нельзя удалить последнего администратора', 409);
         }
         const deleted = store.deleteUser(userId);
+        closeEventClients(client => client.userId === String(userId));
         adminAudit(session.user, 'user.delete', 'user', userId, { login: deleted.login, role: deleted.role });
         return {
           ok: true,
@@ -1479,6 +1613,7 @@ async function handleApi(req, res, pathname, search = '') {
         const target = store.getUserById(userId);
         if (!target) throw new HttpError('Пользователь не найден', 404);
         const removedSessions = store.deleteUserSessions(userId);
+        closeEventClients(client => client.userId === String(userId));
         adminAudit(session.user, 'user.logout', 'user', userId, { removedSessions });
         return { ok: true, removedSessions };
       });
@@ -1506,6 +1641,11 @@ async function handleApi(req, res, pathname, search = '') {
   if (pathname === '/api/v1/admin/demo/reset' && req.method === 'POST') {
     requireAdmin(session.user);
     sendJson(res, 200, await enqueue(async () => {
+      try {
+        store.backup('demo-reset');
+      } catch (error) {
+        console.error('Не удалось создать backup перед сбросом демо', error);
+      }
       await itsm.demoReset();
       store.resetSyncState();
       await synchronize('reset');
@@ -1527,6 +1667,21 @@ async function handleApi(req, res, pathname, search = '') {
       limit = Number(rawLimit);
     }
     sendJson(res, 200, { audit: store.listAudit(limit) });
+    return;
+  }
+
+  if (pathname === '/api/v1/admin/sync-failures' && req.method === 'GET') {
+    requireAdmin(session.user);
+    const params = new URLSearchParams(search);
+    const rawLimit = params.get('limit');
+    let limit = 50;
+    if (rawLimit !== null) {
+      if (!/^\d+$/.test(rawLimit) || Number(rawLimit) < 1 || Number(rawLimit) > 200) {
+        throw new HttpError('limit должен быть целым числом от 1 до 200', 400);
+      }
+      limit = Number(rawLimit);
+    }
+    sendJson(res, 200, { failures: store.listSyncFailures(limit) });
     return;
   }
 
@@ -1559,7 +1714,7 @@ async function handleApi(req, res, pathname, search = '') {
     return;
   }
   if (req.method === 'GET' && pathname === '/api/v1/events') {
-    openEvents(req, res, session.user.id);
+    openEvents(req, res, session.user.id, sessionTokenHash(session.token));
     return;
   }
   if (req.method === 'GET' && pathname === '/api/v1/incidents') {
@@ -1572,7 +1727,8 @@ async function handleApi(req, res, pathname, search = '') {
       adminAudit(session.user, 'sync.manual', 'sync', null, {
         revision: changes.revision,
         added: changes.added,
-        updated: changes.updated
+        updated: changes.updated,
+        rejected: Array.isArray(changes.rejected) ? changes.rejected.length : 0
       });
       return changes;
     }));
@@ -1720,11 +1876,13 @@ async function proxyItsm(req, res, pathname, search) {
     throw new HttpError('Ответ ITSM превышает допустимый размер', 502);
   }
 
+  const proxiedType = response.headers.get('content-type') || 'application/octet-stream';
   res.writeHead(response.status, {
-    'Content-Type': response.headers.get('content-type') || 'application/octet-stream',
+    'Content-Type': proxiedType,
     'Content-Length': body.byteLength,
     'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff'
+    'X-Content-Type-Options': 'nosniff',
+    ...(proxiedType.includes('text/html') ? HTML_SECURITY_HEADERS : {})
   });
   if (req.method === 'HEAD') {
     res.end();
@@ -1839,16 +1997,20 @@ function shutdown() {
     client.res.end();
   }
   wallEventClients.clear();
+  let forced = false;
   const forceTimer = setTimeout(() => {
+    forced = true;
     server.closeAllConnections();
-    closeStore();
-    process.exitCode = 1;
+    try { closeStore(); } catch { /* already closed */ }
+    process.exit(1);
   }, 5000);
   forceTimer.unref();
   server.close(() => {
     clearTimeout(forceTimer);
-    operationTail.finally(closeStore);
-    process.exitCode = 0;
+    operationTail.finally(() => {
+      closeStore();
+      if (!forced) process.exitCode = 0;
+    });
   });
   server.closeIdleConnections();
 }
@@ -1898,13 +2060,25 @@ async function main() {
   pollTimer.unref();
   sessionCleanupTimer = setInterval(() => {
     if (shuttingDown) return;
-    store.deleteExpiredSessions(Date.now());
+    try {
+      store.deleteExpiredSessions(Date.now());
+    } catch (error) {
+      console.error('Не удалось очистить истёкшие сессии', error);
+    }
   }, 60 * 60 * 1000);
   sessionCleanupTimer.unref();
 }
 
 process.once('SIGTERM', shutdown);
 process.once('SIGINT', shutdown);
+process.on('unhandledRejection', error => {
+  console.error('unhandledRejection', error);
+  if (!shuttingDown) shutdown();
+});
+process.on('uncaughtException', error => {
+  console.error('uncaughtException', error);
+  if (!shuttingDown) shutdown();
+});
 main().catch(error => {
   console.error(error);
   closeStore();

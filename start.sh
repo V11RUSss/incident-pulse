@@ -3,8 +3,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if [ ! -f .env ]; then
+  umask 077
   cp .env.example .env
+  chmod 600 .env
 fi
+chmod 600 .env 2>/dev/null || true
 
 load_dotenv() {
   [ -f .env ] || return 0
@@ -34,7 +37,7 @@ MODEL_FILE_ARG=""
 MAX_LEN_ARG=""
 GPU_UTIL_ARG=""
 VLLM_PORT_ARG=""
-REBUILD=0
+REBUILD=1
 DRY_RUN=0
 
 usage() {
@@ -69,7 +72,8 @@ Incident Pulse — два AI-режима.
   --gpu-memory-utilization=<x> доля VRAM для vLLM
   --vllm-port=<port>           порт vLLM на localhost (по умолчанию 8002)
   --port=<port>                порт дашборда (по умолчанию 8080)
-  --rebuild                    пересобрать app
+  --no-build                   не пересобирать образы (быстрый рестарт)
+  --rebuild                    пересобрать образы (по умолчанию)
   --dry-run                    показать выбранный режим/команду без запуска
   -h, --help
 EOF
@@ -78,6 +82,10 @@ EOF
 die() {
   printf 'Ошибка: %s\n' "$1" >&2
   exit 1
+}
+
+redact_url() {
+  printf '%s' "$1" | sed -E 's#(://)[^/@]*@#\1***@#; s#([?&](api[_-]?key|token|password|secret)=)[^&]*#\1***#Ig'
 }
 
 while [ $# -gt 0 ]; do
@@ -135,6 +143,7 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || die "для --port нужно значение"
       PORT_ARG="$2"; shift ;;
     --rebuild) REBUILD=1 ;;
+    --no-build) REBUILD=0 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "неизвестный параметр: $1 (см. --help)" ;;
@@ -201,7 +210,7 @@ if [ "$MODE" = "api" ]; then
   # остановить локальный движок, если он остался от vllm-режима
   docker compose -f docker-compose.yml -f docker-compose.vllm.yml -f docker-compose.vllm-cpu.yml --profile vllm stop vllm model-init >/dev/null 2>&1 || true
   COMPOSE=(docker compose -f docker-compose.yml)
-  printf 'Режим: api/%s (%s, модель %s).\n' "$PROVIDER" "$AI_BASE_URL" "$AI_MODEL"
+  printf 'Режим: api/%s (%s, модель %s).\n' "$PROVIDER" "$(redact_url "$AI_BASE_URL")" "$AI_MODEL"
 else
   if [ "$ENGINE" = "auto" ]; then ENGINE="$(detect_engine)"; fi
   case "$ENGINE" in nvidia|intel|cpu) ;; *) die "engine должен быть auto, nvidia, intel или cpu" ;; esac
@@ -228,7 +237,7 @@ fi
 
 if [ "$DRY_RUN" = "1" ]; then
   if [ "$MODE" = "api" ]; then
-    printf 'DRY-RUN mode=api model=%s base=%s\n' "$AI_MODEL" "$AI_BASE_URL"
+    printf 'DRY-RUN mode=api model=%s base=%s\n' "$AI_MODEL" "$(redact_url "$AI_BASE_URL")"
   else
     printf 'DRY-RUN mode=vllm engine=%s model=%s dir=%s/models/%s\n' "$ENGINE" "$AI_MODEL" "$PWD" "$VLLM_MODEL_NAME"
   fi
@@ -247,9 +256,9 @@ wait_app() {
   local i
   for ((i = 0; i < 100; i++)); do
     if command -v curl >/dev/null 2>&1; then
-      curl -fsS -m 2 "http://127.0.0.1:${HOST_PORT}/api/v1/health" >/dev/null 2>&1 && return 0
+      curl -fsS -m 2 "http://127.0.0.1:${HOST_PORT}/api/v1/ready" >/dev/null 2>&1 && return 0
     else
-      "${COMPOSE[@]}" exec -T app node -e "fetch('http://127.0.0.1:3000/api/v1/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" >/dev/null 2>&1 && return 0
+      "${COMPOSE[@]}" exec -T app node -e "fetch('http://127.0.0.1:3000/api/v1/ready').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))" >/dev/null 2>&1 && return 0
     fi
     sleep 1
   done
@@ -291,7 +300,7 @@ fi
 
 printf '\nГотово.\n'
 if [ "$MODE" = "api" ]; then
-  printf 'Режим:   api (%s, модель %s)\n' "$AI_BASE_URL" "$AI_MODEL"
+  printf 'Режим:   api (%s, модель %s)\n' "$(redact_url "$AI_BASE_URL")" "$AI_MODEL"
 else
   printf 'Режим:   vllm/%s (модель %s)\n' "$ENGINE" "$AI_MODEL"
   printf 'Модель:  %s/models/%s\n' "$PWD" "$VLLM_MODEL_NAME"

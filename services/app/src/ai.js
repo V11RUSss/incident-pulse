@@ -54,14 +54,24 @@ function parseResult(content) {
   const withoutThinking = content
     .replace(/^\s*<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>\s*/i, '')
     .trim();
-  const stripped = withoutThinking.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+  let candidate = withoutThinking;
+  const fenced = withoutThinking.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) candidate = fenced[1].trim();
+  else {
+    const first = withoutThinking.indexOf('{');
+    const last = withoutThinking.lastIndexOf('}');
+    if (first !== -1 && last > first) candidate = withoutThinking.slice(first, last + 1);
+  }
   try {
-    const parsed = JSON.parse(stripped);
+    const parsed = JSON.parse(candidate);
     if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
   } catch {
-    // Not JSON: keep the raw text as a summary.
+    // fall through to the honest failure below
   }
-  return { summary: stripped };
+  throw new AiError('AI-сервис вернул ответ не по схеме (ожидался JSON-объект)', {
+    status: 502,
+    code: 'bad_json'
+  });
 }
 
 class AiClient {

@@ -16,6 +16,7 @@ const FALLBACK_META = Object.freeze({
   postmortemEnabled: true,
   triageEnabled: true,
   triageAiEnabled: true,
+  registrationEnabled: true,
   teams: [
     'КЦ ИТ Координаторы Массовых Инцидентов',
     'МТС ИТ Поддержка Mobile voice',
@@ -39,7 +40,9 @@ const ACTION_LABELS = Object.freeze({
   'priority-override.delete': 'Возврат к автоприоритету',
   deadline: 'Изменение срока SLA',
   team: 'Назначение команды',
-  status: 'Изменение статуса'
+  status: 'Изменение статуса',
+  merge: 'Объединение кейсов',
+  correlation_key: 'Изменение correlationKey'
 });
 
 const ADMIN_ACTION_LABELS = Object.freeze({
@@ -78,6 +81,10 @@ const state = {
   bannerDismissed: false,
   syncing: false,
   live: false,
+  activeId: null,
+  actionBusy: false,
+  historySeq: 0,
+  aiSeq: 0,
   liveEnabled: readLivePreference(),
   suppressNotificationsUntil: 0,
   eventSource: null,
@@ -88,7 +95,8 @@ const state = {
     unread: 0,
     open: false,
     loaded: false,
-    loading: false
+    loading: false,
+    error: null
   },
   inProgress: {
     observer: null,
@@ -212,9 +220,6 @@ const elements = {
   assignedSummary: document.querySelector('#assigned-summary'),
   assignedList: document.querySelector('#assigned-list'),
   assignedEmpty: document.querySelector('#assigned-empty'),
-  unacceptedCount: document.querySelector('#unaccepted-count'),
-  unacceptedList: document.querySelector('#unaccepted-list'),
-  unacceptedEmpty: document.querySelector('#unaccepted-empty'),
   triageChip: document.querySelector('#triage-chip'),
   triagePanel: document.querySelector('#triage-panel'),
   triageTitle: document.querySelector('#triage-title'),
@@ -557,6 +562,7 @@ function setUser(user) {
   if (!user) {
     block.hidden = true;
     if (adminButton) adminButton.hidden = true;
+    resetNotifications();
     closeNotificationPanel();
     syncAssistantVisibility();
     syncRoutingVisibility();
@@ -606,6 +612,7 @@ async function loadMeta() {
         postmortemEnabled: data.postmortemEnabled !== false,
         triageEnabled: data.triageEnabled !== false,
         triageAiEnabled: data.triageAiEnabled !== false,
+        registrationEnabled: data.registrationEnabled !== false,
       };
     } else {
       state.meta = FALLBACK_META;
@@ -617,6 +624,14 @@ async function loadMeta() {
   syncRoutingVisibility();
   updatePostmortemButton();
   renderTriageChip();
+  const registerButton = document.querySelector('#show-register');
+  if (registerButton) registerButton.hidden = state.meta.registrationEnabled === false;
+  const authSegmented = document.querySelector('.segmented');
+  if (authSegmented) authSegmented.hidden = state.meta.registrationEnabled === false;
+  if (state.meta.registrationEnabled === false) {
+    const subtitle = document.querySelector('.auth-subtitle');
+    if (subtitle) subtitle.textContent = 'Вход координатора. Самостоятельная регистрация закрыта — обратитесь к администратору.';
+  }
 }
 
 async function loadCoordinators() {
@@ -667,6 +682,30 @@ function queueRefresh(options) {
   return refreshChain;
 }
 
+function deepLinkCaseKey() {
+  const params = new URLSearchParams(window.location.search);
+  const fromQuery = params.get('case') || params.get('incident');
+  if (fromQuery) return fromQuery.trim();
+  if (window.location.hash.startsWith('#case=')) {
+    try { return decodeURIComponent(window.location.hash.slice(6)).trim(); } catch { return ''; }
+  }
+  return '';
+}
+
+function openLinkedCase() {
+  const key = deepLinkCaseKey();
+  if (!key) return false;
+  const normalized = key.toLowerCase();
+  const incident = state.incidents.find(item => (
+    String(item.caseId).toLowerCase() === normalized ||
+    String(item.id).toLowerCase() === normalized
+  ));
+  if (!incident) return false;
+  if (state.view !== 'our') setWorkspaceView('our');
+  openIncident(incident.caseId);
+  return true;
+}
+
 async function enterDashboard() {
   setWorkspaceView('our');
   showView('dashboard');
@@ -677,9 +716,30 @@ async function enterDashboard() {
   } catch (error) {
     if (error && error.status === 401) handleUnauthorized();
   }
+  if (new URLSearchParams(window.location.search).get('view') === 'assigned') {
+    setWorkspaceView('assigned');
+  }
+  openLinkedCase();
   if (state.liveEnabled) connectEvents();
   else closeEvents();
   loadNotifications();
+}
+
+async function loadAuthConfig() {
+  try {
+    const data = await api('/api/v1/auth/config');
+    const enabled = data.registrationEnabled !== false;
+    const registerButton = document.querySelector('#show-register');
+    if (registerButton) registerButton.hidden = !enabled;
+    const segmented = document.querySelector('.segmented');
+    if (segmented) segmented.hidden = !enabled;
+    if (!enabled) {
+      const subtitle = document.querySelector('.auth-subtitle');
+      if (subtitle) subtitle.textContent = 'Вход координатора. Самостоятельная регистрация закрыта — обратитесь к администратору.';
+    }
+  } catch {
+    // Keep the login form usable even if auth config is temporarily unavailable.
+  }
 }
 
 async function bootstrap() {
@@ -689,6 +749,7 @@ async function bootstrap() {
     await enterDashboard();
   } catch (error) {
     setUser(null);
+    await loadAuthConfig();
     showView('auth');
     if (error.status !== 401) {
       const globalError = document.querySelector('#auth-global-error');
@@ -705,8 +766,19 @@ function connectEvents() {
   const source = new EventSource('/api/v1/events');
   state.eventSource = source;
   source.onopen = () => {
+    const reconnected = !state.live;
     state.live = true;
     renderLive();
+    if (state.user) {
+      // Events missed during a network blip are not replayed by the server:
+      // re-read the board and the bell as soon as the stream is back.
+      queueRefresh({ notify: false });
+      loadNotifications();
+      if (reconnected && state.activeId) {
+        const incident = findIncident(state.activeId);
+        if (incident) populateDialog(incident, { resetInputs: false });
+      }
+    }
   };
   source.onerror = () => {
     state.live = false;
@@ -834,7 +906,12 @@ function renderNotificationList() {
     item.append(button);
     list.append(item);
   }
-  if (elements.notificationEmpty) elements.notificationEmpty.hidden = state.notifications.items.length > 0;
+  if (elements.notificationEmpty) {
+    elements.notificationEmpty.hidden = state.notifications.items.length > 0;
+    elements.notificationEmpty.textContent = state.notifications.error
+      ? `Не удалось загрузить уведомления: ${state.notifications.error}`
+      : 'Уведомлений нет';
+  }
 }
 
 function renderNotifications() {
@@ -879,9 +956,10 @@ async function loadNotifications() {
   if (!state.user || state.notifications.loading) return;
   state.notifications.loading = true;
   try {
-    const data = await api('/api/v1/notifications');
+    const data = await api('/api/v1/notifications?limit=200');
     const items = Array.isArray(data.notifications) ? data.notifications : [];
     state.notifications.items = items;
+    state.notifications.error = null;
     state.notifications.unread = notificationUnread(
       data.unread,
       items.filter(notification => !notification.readAt).length
@@ -892,7 +970,10 @@ async function loadNotifications() {
       handleUnauthorized();
       return;
     }
-    // The notifications backend is optional: keep an empty, working bell on failure.
+    state.notifications.items = [];
+    state.notifications.unread = 0;
+    state.notifications.loaded = false;
+    state.notifications.error = error.message || 'не удалось загрузить уведомления';
   } finally {
     state.notifications.loading = false;
   }
@@ -931,7 +1012,8 @@ async function markNotificationRead(notification) {
       handleUnauthorized();
       return;
     }
-    unread = Math.max(0, state.notifications.unread - 1);
+    showToast('Не удалось отметить уведомление', error.message, false);
+    return;
   }
   notification.readAt = notification.readAt || Date.now();
   state.notifications.unread = unread;
@@ -963,6 +1045,7 @@ function resetNotifications() {
   state.notifications.unread = 0;
   state.notifications.loaded = false;
   state.notifications.loading = false;
+  state.notifications.error = null;
   renderNotifications();
 }
 
@@ -1417,6 +1500,9 @@ function renderTriagePanel() {
 
 function openTriagePanel(options = {}) {
   if (!triageEnabled() || !state.triage.report) return;
+  // A native <dialog> lives in the top layer: an aside behind it is invisible
+  // and inert. Close the case dialog before showing the duplicate panel.
+  if (elements.dialog && elements.dialog.open) elements.dialog.close();
   const caseId = options && options.caseId ? String(options.caseId) : null;
   if (state.assistant.open) closeAssistant();
   if (state.routing.queueOpen) closeRoutingPanel();
@@ -1873,7 +1959,7 @@ async function loadAssignedUpdated(incident) {
 
 function assignedIncidentNode(incident) {
   const item = document.createElement('li');
-  item.className = 'assigned-item';
+  item.className = 'assigned-item priority-' + incident.priorityId;
   const head = document.createElement('div');
   head.className = 'assigned-item-head';
   const open = document.createElement('button');
@@ -1894,6 +1980,7 @@ function assignedIncidentNode(incident) {
   slaBadge.className = 'assigned-sla ' + toneClass(sla.tone);
   slaBadge.title = sla.label;
   slaBadge.textContent = 'SLA ' + sla.value;
+  slaBadge.dataset.slaId = String(incident.caseId);
   head.append(slaBadge);
   item.append(head);
   const fields = document.createElement('dl');
@@ -1906,11 +1993,14 @@ function assignedIncidentNode(incident) {
     detail.textContent = value;
     group.append(term, detail);
     fields.append(group);
+    return detail;
   };
   addField('Приоритет', incident.priorityText || priorityLabel(incident.priorityId));
   addField('Команда', incident.team || '—');
   addField('Статус', incident.status);
-  addField('SLA', sla.value + ' · ' + sla.label);
+  const slaField = addField('SLA', sla.value + ' · ' + sla.label);
+  slaField.dataset.slaId = String(incident.caseId);
+  slaField.classList.add('assigned-sla-field');
   const direct = assignedDirectUpdated(incident);
   const cached = state.assigned.updated.get(String(incident.caseId));
   const hasCached = cached && cached.version === incident.version;
@@ -1923,92 +2013,51 @@ function assignedIncidentNode(incident) {
   return item;
 }
 
-function unacceptedAssignments() {
-  return state.notifications.items.filter(notification =>
-    notification.type === 'coordinator_assigned' && !notification.readAt
-  );
-}
-
-function unacceptedAssignmentNode(notification) {
-  const item = document.createElement('li');
-  item.className = 'unaccepted-item';
-  const copy = document.createElement('div');
-  copy.className = 'unaccepted-copy';
-  const title = document.createElement('strong');
-  title.textContent = notification.title || 'Назначение координатору';
-  copy.append(title);
-  if (notification.message) {
-    const message = document.createElement('span');
-    message.textContent = notification.message;
-    copy.append(message);
-  }
-  const time = document.createElement('time');
-  const timestamp = notificationTimestamp(notification.createdAt);
-  if (timestamp !== null) {
-    time.dateTime = new Date(timestamp).toISOString();
-    time.textContent = formatRelative(timestamp);
-  }
-  copy.append(time);
-  item.append(copy);
-  const actions = document.createElement('div');
-  actions.className = 'unaccepted-actions';
-  const accept = document.createElement('button');
-  accept.type = 'button';
-  accept.className = 'button button-primary button-sm';
-  accept.textContent = 'Принять';
-  accept.dataset.acceptNotification = String(notification.id);
-  const open = document.createElement('button');
-  open.type = 'button';
-  open.className = 'button button-secondary button-sm';
-  open.textContent = 'Открыть';
-  const identifier = notification.caseId || notification.incidentId || '';
-  open.dataset.assignedOpen = String(identifier);
-  open.disabled = !identifier;
-  actions.append(accept, open);
-  item.append(actions);
-  return item;
-}
-
-function renderUnacceptedAssignments() {
-  const list = elements.unacceptedList;
-  if (!list) return;
-  const items = unacceptedAssignments();
-  if (elements.unacceptedCount) elements.unacceptedCount.textContent = String(items.length);
-  list.replaceChildren();
-  for (const notification of items) list.append(unacceptedAssignmentNode(notification));
-  if (elements.unacceptedEmpty) elements.unacceptedEmpty.hidden = items.length > 0;
-}
-
 function renderAssignedView() {
   if (state.view !== 'assigned' || !elements.workspacePaneAssigned) return;
   const incidents = assignedIncidents();
   const summary = incidents.length
-    ? incidents.length + ' ' + plural(incidents.length, 'инцидент', 'инцидента', 'инцидентов') + ' назначено вам'
-    : 'Назначений нет';
+    ? incidents.length + ' ' + plural(incidents.length, 'инцидент', 'инцидента', 'инцидентов') + ' у вас'
+    : 'Инцидентов нет';
   if (elements.assignedSummary) elements.assignedSummary.textContent = summary;
   const list = elements.assignedList;
   if (list) {
     list.replaceChildren();
+    const byPriority = new Map([[4, []], [3, []], [2, []], [1, []]]);
     for (const incident of incidents) {
-      list.append(assignedIncidentNode(incident));
-      const direct = assignedDirectUpdated(incident);
-      const cached = state.assigned.updated.get(String(incident.caseId));
-      const hasCached = cached && cached.version === incident.version;
-      if (direct === null && !hasCached) loadAssignedUpdated(incident);
+      const bucket = byPriority.get(incident.priorityId);
+      if (bucket) bucket.push(incident);
+    }
+    for (const priorityId of [4, 3, 2, 1]) {
+      const groupIncidents = byPriority.get(priorityId);
+      if (!groupIncidents.length) continue;
+      const group = document.createElement('li');
+      group.className = 'assigned-group priority-' + priorityId;
+      const head = document.createElement('div');
+      head.className = 'assigned-group-head';
+      const badge = document.createElement('span');
+      badge.className = 'priority-badge priority-' + priorityId;
+      badge.textContent = priorityLabel(priorityId);
+      const count = document.createElement('span');
+      count.className = 'assigned-group-count';
+      count.textContent = String(groupIncidents.length);
+      head.append(badge, count);
+      group.append(head);
+      const groupList = document.createElement('ul');
+      groupList.className = 'assigned-group-list';
+      groupList.setAttribute('role', 'list');
+      for (const incident of groupIncidents) {
+        groupList.append(assignedIncidentNode(incident));
+        const direct = assignedDirectUpdated(incident);
+        const cached = state.assigned.updated.get(String(incident.caseId));
+        const hasCached = cached && cached.version === incident.version;
+        if (direct === null && !hasCached) loadAssignedUpdated(incident);
+      }
+      group.append(groupList);
+      list.append(group);
     }
   }
   if (elements.assignedEmpty) elements.assignedEmpty.hidden = incidents.length > 0;
-  renderUnacceptedAssignments();
-}
-
-async function acceptAssignedNotification(button) {
-  const id = button && button.dataset ? button.dataset.acceptNotification : null;
-  if (!id) return;
-  const notification = state.notifications.items.find(item => String(item.id) === String(id));
-  if (!notification || notification.readAt) return;
-  button.disabled = true;
-  await markNotificationRead(notification);
-  if (state.view === 'assigned') renderAssignedView();
 }
 
 function openAssignedIncident(identifier) {
@@ -2023,11 +2072,6 @@ function openAssignedIncident(identifier) {
 }
 
 function onAssignedPaneClick(event) {
-  const accept = event.target.closest('[data-accept-notification]');
-  if (accept) {
-    acceptAssignedNotification(accept);
-    return;
-  }
   const open = event.target.closest('[data-assigned-open]');
   if (open) openAssignedIncident(open.dataset.assignedOpen);
 }
@@ -2246,7 +2290,6 @@ function renderSummary() {
   setText('#active-total', total);
   setText('#risk-count', counts.risk ?? 0);
   setText('#affected-count', formatNumber(counts.affectedUsers ?? 0));
-  setText('#last-sync-label', state.lastSyncedAt ? formatRelative(state.lastSyncedAt) : '—');
   const archiveHint = document.querySelector('#archive-hint');
   if (archiveHint) archiveHint.hidden = !state.filters.archive;
 }
@@ -2288,7 +2331,6 @@ function renderSyncState() {
   if (!warning) return;
   warning.hidden = !state.syncError;
   if (state.syncError) warning.textContent = `Ошибка синхронизации: ${state.syncError}`;
-  setText('#last-sync-label', state.lastSyncedAt ? formatRelative(state.lastSyncedAt) : '—');
 }
 
 function updateCountdowns() {
@@ -2300,6 +2342,16 @@ function updateCountdowns() {
       element.textContent = sla.value;
       const label = document.querySelector('#banner-sla-label');
       if (label) label.textContent = sla.label;
+      continue;
+    }
+    if (element.classList.contains('assigned-sla')) {
+      element.textContent = 'SLA ' + sla.value;
+      element.title = sla.label;
+      element.className = 'assigned-sla ' + toneClass(sla.tone);
+      continue;
+    }
+    if (element.classList.contains('assigned-sla-field')) {
+      element.textContent = sla.value + ' · ' + sla.label;
       continue;
     }
     element.textContent = sla.value;
@@ -2588,10 +2640,12 @@ function applyAssistantResult(result) {
   state.filters.search = '';
   state.filters.product = 'all';
   state.filters.riskOnly = false;
+  state.filters.unassigned = false;
   state.filters.archive = result.matched.closed === result.matched.count && result.matched.count > 0;
   if (elements.search) elements.search.value = '';
   if (elements.product) elements.product.value = 'all';
   if (elements.risk) elements.risk.checked = false;
+  if (elements.coordinator) elements.coordinator.checked = false;
   render();
   closeAssistant();
   announce('ИИ-фильтр: найдено ' + state.assistant.count + ' инцидентов.');
@@ -3331,11 +3385,16 @@ function announce(message, critical = false) {
 
 function announceResults(filtered) {
   const uniqueCount = new Set(filtered.map(incident => incident.caseId)).size;
-  const suffix = uniqueCount === 1 ? 'инцидент' : uniqueCount > 1 && uniqueCount < 5 ? 'инцидента' : 'инцидентов';
+  const suffix = plural(uniqueCount, 'инцидент', 'инцидента', 'инцидентов');
   announce(`По выбранным условиям найдено ${uniqueCount} ${suffix}`);
 }
 
 function showToast(title, message, critical = false) {
+  // A modal <dialog> is always above the page, so a z-index-only toast is
+  // invisible while an incident is open. Move the live region into the dialog
+  // (top layer) for the duration of the modal.
+  const toastHost = elements.dialog && elements.dialog.open ? elements.dialog : document.body;
+  if (elements.toast.parentElement !== toastHost) toastHost.append(elements.toast);
   clearTimeout(state.toastTimer);
   setText('#toast-title', title);
   setText('#toast-message', message);
@@ -3381,6 +3440,7 @@ function populateSla(incident) {
 
 function sourceSummary(incident) {
   const ids = incident.sourceIds || [];
+  if (!ids.length) return '0 источников';
   const shown = ids.slice(0, 3).join(', ');
   if (ids.length > 3) return `${ids.length} источников · ${shown} …`;
   return `${ids.length} ${plural(ids.length, 'источник', 'источника', 'источников')} · ${shown}`;
@@ -3435,8 +3495,11 @@ function updateTakeWorkButton(incident) {
   button.hidden = !active;
   const mine = Boolean(state.user) && incident.coordinatorId === state.user.id;
   const performing = incident.stateId === 2;
-  button.disabled = mine && performing;
-  button.textContent = mine && performing ? 'Инцидент в работе' : 'Взять в работу';
+  const takenByOther = Boolean(incident.coordinatorId) && !mine;
+  button.disabled = takenByOther || (mine && performing);
+  button.textContent = takenByOther
+    ? 'Назначен другому координатору'
+    : mine && performing ? 'Инцидент в работе' : 'Взять в работу';
 }
 
 function populatePriorityInfo(incident) {
@@ -3448,7 +3511,8 @@ function populatePriorityInfo(incident) {
   warning.textContent = differs ? 'Ручной приоритет отличается от автоматического' : 'Установлен ручной приоритет';
   document.querySelector('#priority-auto-button').hidden = !manual;
   const select = document.querySelector('#priority-select');
-  if (document.activeElement !== select) select.value = String(incident.priorityId);
+  const dirty = select.dataset.dirty === '1' && state.activeId === incident.caseId;
+  if (!dirty && document.activeElement !== select) select.value = String(incident.priorityId);
 }
 
 function setActionVisibility(incident) {
@@ -3601,6 +3665,10 @@ function populateActions(incident, { resetInputs = false } = {}) {
 }
 
 function populateDialog(incident, { resetInputs = false } = {}) {
+  if (resetInputs) {
+    const prioritySelect = document.querySelector('#priority-select');
+    if (prioritySelect) prioritySelect.dataset.dirty = '0';
+  }
   setText('#dialog-id', incident.id);
   setText('#dialog-title', incident.title);
   setText('#dialog-product', [incident.product, incident.service, incident.scenario].filter(Boolean).join(' · '));
@@ -3642,6 +3710,7 @@ function setDialogBusy(busy) {
   document.querySelectorAll('#incident-actions button').forEach(button => {
     button.disabled = busy;
   });
+  if (elements.takeWorkButton) elements.takeWorkButton.disabled = busy;
   if (!busy) {
     const incident = currentIncident();
     if (incident) updateTakeWorkButton(incident);
@@ -3675,9 +3744,11 @@ function showDialogError(error) {
 async function loadHistory(caseId) {
   const list = document.querySelector('#history-list');
   if (!list) return;
+  const requestId = ++state.historySeq;
   list.innerHTML = '<li class="history-empty">Загрузка истории…</li>';
   try {
     const data = await api(`/api/v1/incidents/${encodeURIComponent(caseId)}/history`);
+    if (requestId !== state.historySeq || state.activeId !== caseId) return;
     const history = Array.isArray(data.history) ? data.history : [];
     state.postmortem.caseId = caseId;
     state.postmortem.history = history;
@@ -3690,6 +3761,7 @@ async function loadHistory(caseId) {
     renderHistory(history);
   } catch (error) {
     if (error.status === 401) { handleUnauthorized(); return; }
+    if (requestId !== state.historySeq || state.activeId !== caseId) return;
     state.postmortem.history = [];
     if (state.postmortem.data) resetPostmortem({ abort: true });
     updatePostmortemButton();
@@ -3716,6 +3788,12 @@ function formatHistoryDetails(item) {
       const solution = details.solution ? ` · ${escapeHtml(details.solution)}` : '';
       return `→ ${escapeHtml(status)}${solution}`;
     }
+    case 'merge': {
+      const count = Array.isArray(details.sourceCaseIds) ? details.sourceCaseIds.length : 1;
+      return `${count} ${plural(count, 'кейс', 'кейса', 'кейсов')} перенесено в целевой`;
+    }
+    case 'correlation_key':
+      return details.correlationKey ? `→ ${escapeHtml(details.correlationKey)}` : '';
     default:
       return '';
   }
@@ -3784,6 +3862,7 @@ async function requestAiSummary(caseId) {
   const status = document.querySelector('#ai-status');
   const label = document.querySelector('#ai-label');
   const note = document.querySelector('#ai-note');
+  const requestId = ++state.aiSeq;
   if (button) button.disabled = true;
   if (status) {
     status.hidden = false;
@@ -3796,6 +3875,7 @@ async function requestAiSummary(caseId) {
   }
   try {
     const data = await api('/api/v1/ai/summary', { method: 'POST', body: caseId ? { caseId } : {} });
+    if (requestId !== state.aiSeq || (caseId && state.activeId !== caseId)) return;
     renderAiResult(data);
     if (status) status.hidden = true;
     if (label) {
@@ -3809,6 +3889,7 @@ async function requestAiSummary(caseId) {
     }
   } catch (error) {
     if (error.status === 401) { handleUnauthorized(); return; }
+    if (requestId !== state.aiSeq || (caseId && state.activeId !== caseId)) return;
     if (status) {
       status.hidden = false;
       status.textContent = `Не удалось получить сводку: ${error.message}`;
@@ -3820,13 +3901,15 @@ async function requestAiSummary(caseId) {
     document.querySelector('#ai-summary').textContent = 'Сводка недоступна';
     document.querySelector('#ai-recommendation').hidden = true;
   } finally {
-    if (button) button.disabled = false;
+    if (button && requestId === state.aiSeq) button.disabled = false;
   }
 }
 
 /* ----------------------------------------------------------------- actions */
 
 async function performAction(incident, action, body, method = 'POST') {
+  if (state.actionBusy) return false;
+  state.actionBusy = true;
   const path = action === 'priority-override'
     ? `/api/v1/incidents/${encodeURIComponent(incident.caseId)}/priority-override`
     : `/api/v1/incidents/${encodeURIComponent(incident.caseId)}/${action}`;
@@ -3849,6 +3932,7 @@ async function performAction(incident, action, body, method = 'POST') {
       if (error.status === 409 || error.status === 400) await queueRefresh({ notify: false });
     }
   } finally {
+    state.actionBusy = false;
     setDialogBusy(false);
   }
   return success;
@@ -4499,7 +4583,13 @@ function bindEvents() {
     }
   });
 
+  const prioritySelect = document.querySelector('#priority-select');
+  if (prioritySelect) {
+    prioritySelect.addEventListener('change', () => { prioritySelect.dataset.dirty = '1'; });
+  }
+
   elements.dialog.addEventListener('close', () => {
+    if (elements.toast && elements.toast.parentElement !== document.body) document.body.append(elements.toast);
     resetRoutingSuggestion({ abort: true });
     closePostmortem();
     state.activeId = null;
@@ -4510,19 +4600,6 @@ function bindEvents() {
     if (target) target.focus();
   });
 
-  if (!('closedBy' in HTMLDialogElement.prototype)) {
-    const outside = (event, dialog) => {
-      const rect = dialog.getBoundingClientRect();
-      return event.clientX < rect.left || event.clientX > rect.right || event.clientY < rect.top || event.clientY > rect.bottom;
-    };
-    let pressedOutside = false;
-    elements.dialog.addEventListener('pointerdown', event => {
-      pressedOutside = outside(event, elements.dialog);
-    });
-    elements.dialog.addEventListener('pointerup', event => {
-      if (pressedOutside && outside(event, elements.dialog)) elements.dialog.close();
-    });
-  }
 }
 
 bindEvents();

@@ -333,36 +333,32 @@ function continuationId(product, seq) {
   return `MTS-${product.code}-${String(100 + seq).padStart(4, '0')}`;
 }
 
-function criticalRecordId(demoStep) {
-  return `MTS-CRIT-${String(demoStep).padStart(4, '0')}`;
-}
-
 function generateCriticalIncident(records, demoStep, continuationIndex, now) {
   const criticalIndex = Math.floor(continuationIndex / CRITICAL_EVERY);
-  if (criticalIndex % 2 === 1) {
-    const candidates = [...records.values()]
-      .filter((record) => (
-        (record.stateId === 0 || record.stateId === 2) && record.affectedUsers < 1000
-      ))
-      .sort((a, b) => a.id.localeCompare(b.id));
-    if (candidates.length) {
-      const target = candidates[criticalIndex % candidates.length];
-      const affectedUsers = Math.max(1000, target.affectedUsers + 500);
-      return change(records, target.id, now, {
-        affectedUsers,
-        reportCount: target.reportCount + 1,
-        isNeedUp: true,
-        description: `${target.description} Эскалация: число затронутых пользователей выросло до ${affectedUsers}, инцидент переведён в критический контур.`,
-      });
-    }
+  // Critical steps escalate a real active incident instead of creating a
+  // placeholder "demo" card. This keeps the board believable and still
+  // produces regular critical escalation every CRITICAL_EVERY steps.
+  const candidates = [...records.values()]
+    .filter((record) => record.stateId === 0 || record.stateId === 2)
+    .sort((a, b) => a.id.localeCompare(b.id));
+  if (candidates.length) {
+    const target = candidates[criticalIndex % candidates.length];
+    const affectedUsers = Math.max(1000, target.affectedUsers + 500);
+    return change(records, target.id, now, {
+      affectedUsers,
+      reportCount: target.reportCount + 1,
+      isNeedUp: true,
+      description: `${target.description} Эскалация: число затронутых пользователей выросло до ${affectedUsers}, инцидент переведён в критический контур.`,
+    });
   }
-
+  // All records are closed — fall back to a realistic critical record rather
+  // than skipping the cadence or reusing the old demo placeholder.
   const region = continuationRegion(demoStep);
   const affectedUsers = 1200 + ((demoStep * 137) % 1801);
-  return add(records, criticalRecordId(demoStep), now, {
-    correlationKey: `critical-demo-${demoStep}`,
-    header: 'Критический массовый инцидент (демонстрация)',
-    description: `Демонстрационный критический инцидент с массовым влиянием. Регион: ${region}.`,
+  return add(records, `MTS-CRIT-${String(demoStep).padStart(4, '0')}`, now, {
+    correlationKey: `critical-fallback-${demoStep}`,
+    header: 'Массовый сбой в облачной инфраструктуре МТС',
+    description: `Критический инцидент с массовым влиянием. Регион: ${region}.`,
     productName: 'МТС Cloud',
     service: 'Облачные виртуальные машины',
     scenarioName: 'Доступ к виртуальной машине',
