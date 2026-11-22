@@ -89,6 +89,7 @@ const state = {
   suppressNotificationsUntil: 0,
   eventSource: null,
   toastTimer: null,
+  bannerTimer: null,
   announcementTimer: null,
   notifications: {
     items: [],
@@ -848,10 +849,15 @@ function detectChanges(previous, next) {
   if (teamChanges.length) showToast('Команда изменена', teamChanges.map(item => item.id).join(', '));
   if (coordinatorChanges.length) showToast('Координатор изменён', coordinatorChanges.map(item => item.id).join(', '));
   if (newSlaRisk) showToast('Риск нарушения SLA', `${newSlaRisk.id} · ${newSlaRisk.title}`, true);
-  if (newCritical) {
-    state.latestCriticalId = newCritical.caseId;
+  const escalatedToCritical = escalated && escalated.groups.includes('critical') ? escalated : null;
+  const bannerIncident = newCritical || escalatedToCritical;
+  if (bannerIncident) {
+    state.latestCriticalId = bannerIncident.caseId;
     state.bannerDismissed = false;
     renderBanner();
+    scheduleBannerDismiss();
+  }
+  if (newCritical) {
     showToast('Новый критический инцидент', `${newCritical.id} · ${newCritical.product}`, true);
     announce(`Новый критический инцидент ${newCritical.id}. ${newCritical.title}.`, true);
   } else if (escalated) {
@@ -2292,6 +2298,15 @@ function renderSummary() {
   setText('#affected-count', formatNumber(counts.affectedUsers ?? 0));
   const archiveHint = document.querySelector('#archive-hint');
   if (archiveHint) archiveHint.hidden = !state.filters.archive;
+}
+
+function scheduleBannerDismiss() {
+  clearTimeout(state.bannerTimer);
+  state.bannerTimer = setTimeout(() => {
+    if (!elements.banner || elements.banner.hidden) return;
+    state.bannerDismissed = true;
+    elements.banner.hidden = true;
+  }, 10000);
 }
 
 function renderBanner() {
@@ -4493,6 +4508,7 @@ function bindEvents() {
   });
 
   document.querySelector('#banner-close').addEventListener('click', () => {
+    clearTimeout(state.bannerTimer);
     state.bannerDismissed = true;
     elements.banner.hidden = true;
     announce('Уведомление скрыто. Критический инцидент остаётся в группе критических.');
