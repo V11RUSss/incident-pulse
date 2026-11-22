@@ -30,7 +30,7 @@ AI/integrations, ops/release) + сквозное ручное/автоматиз
 
 | ID | Область | Проблема | Статус |
 | --- | --- | --- | --- |
-| SEC-01 / OPS-02 | Auth | Открытая регистрация; первый пользователь получает admin; нет выключателя | FIXED: по умолчанию REGISTRATION_ENABLED=false, bootstrap-скрипт, REGISTRATION_TOKEN, rate-limit, пароль >= 8, скрытие вкладки; для demo можно включить явно |
+| SEC-01 / OPS-02 | Auth | Открытая регистрация; первый пользователь получает admin; нет выключателя | FIXED: REGISTRATION_ENABLED (демо — true, production — false), bootstrap-скрипт, REGISTRATION_TOKEN, rate-limit, пароль >= 8, скрытие вкладки |
 | SEC-02 / AI-01 / OPS-01 | ITSM mock | Mock без auth опубликован на 0.0.0.0:8081; demo/reset стирает cases/history | FIXED: MOCK_BIND по умолчанию 127.0.0.1; app делает backup перед destructive reset; mock не публикуется наружу |
 | SEC-03 / OPS-03 | TLS | Нет TLS, COOKIE_SECURE зашит false, HSTS не было | MITIGATED: COOKIE_SECURE через env, HSTS/Permissions-Policy в HTML, runbook с nginx/TLS; TLS остаётся обязанностью прокси |
 | OPS-04 | Demo | DEMO_GENERATION=true зашит в compose | FIXED: переменная окружения, default true для demo, runbook требует false |
