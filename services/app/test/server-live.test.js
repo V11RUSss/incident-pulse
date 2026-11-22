@@ -103,6 +103,7 @@ function startApp(dataDir, env = {}) {
       ITSM_MOCK_URL: 'http://127.0.0.1:1',
       POLL_INTERVAL_MS: '100',
       DEMO_GENERATION: 'true',
+      AUTO_ROUTING_ENABLED: 'false',
       DEMO_MIN_INTERVAL_MS: '1000',
       DEMO_MAX_INTERVAL_MS: '1000',
       DEMO_BATCH_MIN: '1',
@@ -407,3 +408,47 @@ test('live on: batch is clamped so active cases never exceed DEMO_MAX_ACTIVE', {
   assert.equal(dashboard.payload.counts.active, 20);
 });
 
+
+test('auto-routing assigns a profile team and records history', { timeout: 60000 }, async (t) => {
+  const mock = startMock(tempDir(t, 'incident-pulse-auto-route-mock-'));
+  t.after(() => stopChild(mock.child));
+  const mockUrl = 'http://127.0.0.1:' + Number((await mock.ready)[1]);
+  const tick = await jsonRequest(mockUrl + '/itsm/demo/tick', { method: 'POST' });
+  assert.equal(tick.status, 200);
+
+  const app = startApp(tempDir(t, 'incident-pulse-auto-route-app-'), {
+    ITSM_MOCK_URL: mockUrl,
+    DEMO_GENERATION: 'false',
+    AUTO_ROUTING_ENABLED: 'true'
+  });
+  t.after(() => stopChild(app.child));
+  const baseUrl = 'http://127.0.0.1:' + Number((await app.ready)[1]);
+  const user = await register(baseUrl, 'Auto Route', 'auto-route');
+
+  const dashboard = await jsonRequest(baseUrl + '/api/v1/incidents', { cookie: user.cookie });
+  assert.equal(dashboard.status, 200);
+  const incident = dashboard.payload.incidents.find(row => row.id === 'MTS-MOBILE-0001');
+  assert.ok(incident, 'expected the seeded incident');
+  assert.equal(incident.team, 'МТС ИТ Поддержка Mobile voice');
+  assert.equal(incident.stateId, 2);
+  assert.equal(incident.groups.includes('coordination'), false);
+
+  const history = await jsonRequest(baseUrl + '/api/v1/incidents/' + encodeURIComponent(incident.caseId) + '/history', { cookie: user.cookie });
+  assert.equal(history.status, 200);
+  const auto = history.payload.history.find(entry => entry.action === 'auto_team');
+  assert.ok(auto, 'expected auto_team history');
+  assert.equal(auto.details.team, 'МТС ИТ Поддержка Mobile voice');
+  assert.equal(auto.userName, 'Автоматическая маршрутизация');
+
+  const snapshot = await mockSnapshot(mockUrl);
+  assert.equal(snapshot.incidents.find(row => row.id === 'MTS-MOBILE-0001').assignedGroupName, 'МТС ИТ Поддержка Mobile voice');
+
+  // A delta that triggers auto-routing must return the final revision, not
+  // the revision before the routing writes.
+  const nextTick = await jsonRequest(mockUrl + '/itsm/demo/tick', { method: 'POST' });
+  assert.equal(nextTick.status, 200);
+  const manual = await jsonRequest(baseUrl + '/api/v1/sync/itsm', { method: 'POST', cookie: user.cookie });
+  assert.equal(manual.status, 200);
+  const after = await mockSnapshot(mockUrl);
+  assert.equal(manual.payload.revision, after.revision);
+});

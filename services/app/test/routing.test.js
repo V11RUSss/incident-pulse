@@ -38,6 +38,13 @@ test('deterministic product rules', () => {
   assert.equal(ruleSuggestion(incident({ product: 'Неизвестный продукт', scenario: 'неизвестно' })), null);
 });
 
+test('rules do not match keywords inside unrelated words', () => {
+  assert.equal(ruleSuggestion(incident({ product: 'Capital', scenario: 'Capital markets' })), null);
+  assert.equal(ruleSuggestion(incident({ product: 'Неизвестный продукт', scenario: 'Rapid incident response' })), null);
+  assert.equal(ruleSuggestion(incident({ product: 'Неизвестный продукт', scenario: 'Обработка входящих заявок' })), null);
+  assert.equal(ruleSuggestion(incident({ product: 'Сеть магазинов', scenario: 'Консультация' })), null);
+});
+
 test('parses and canonicalizes a valid suggestion', () => {
   const result = parseRoutingResponse(JSON.stringify({
     team: 'мтс ит поддержка kion',

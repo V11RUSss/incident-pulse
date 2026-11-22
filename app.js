@@ -40,6 +40,7 @@ const ACTION_LABELS = Object.freeze({
   'priority-override.delete': 'Возврат к автоприоритету',
   deadline: 'Изменение срока SLA',
   team: 'Назначение команды',
+  auto_team: 'Автоназначение команды',
   status: 'Изменение статуса',
   merge: 'Объединение кейсов',
   correlation_key: 'Изменение correlationKey'
@@ -118,6 +119,7 @@ const state = {
     merge: null
   },
   view: 'our',
+  groupVisible: { critical: 20, coordination: 20, high: 20, research: 20, inProgress: 20, archive: 20 },
   assigned: {
     updated: new Map(),
     loading: new Set()
@@ -590,6 +592,7 @@ function handleUnauthorized() {
   resetPostmortem({ abort: true, clearHistory: true, clearCache: true });
   resetTriage();
   setUser(null);
+  resetGroupVisibility();
   state.incidents = [];
   state.counts = null;
   state.activeId = null;
@@ -1043,6 +1046,10 @@ async function markAllNotificationsRead() {
   }
   state.notifications.unread = 0;
   renderNotifications();
+}
+
+function resetGroupVisibility() {
+  state.groupVisible = { critical: 20, coordination: 20, high: 20, research: 20, inProgress: 20, archive: 20 };
 }
 
 function resetNotifications() {
@@ -2185,19 +2192,56 @@ function renderGroups() {
   for (const group of groupKeys) {
     const items = filtered.filter(incident => incident.groups.includes(group)).sort(compareIncidents);
     const list = document.querySelector(`#list-${group}`);
-    list.innerHTML = items.length
-      ? items.map(incident => renderCard(incident, group)).join('')
+    const limit = state.groupVisible[group] ?? items.length;
+    const visible = items.slice(0, limit);
+    list.innerHTML = visible.length
+      ? visible.map(incident => renderCard(incident, group)).join('')
       : '<li class="empty-state">Нет инцидентов по выбранным условиям</li>';
     setText(`#group-count-${group}`, items.length);
+    let more = document.querySelector('#more-' + group);
+    if (!more) {
+      more = document.createElement('button');
+      more.type = 'button';
+      more.id = 'more-' + group;
+      more.className = 'button button-secondary group-more';
+      more.setAttribute('aria-controls', 'list-' + group);
+      more.addEventListener('click', () => {
+        state.groupVisible[group] = (state.groupVisible[group] || 20) + 20;
+        render();
+      });
+      list.insertAdjacentElement('afterend', more);
+    }
+    const remaining = items.length - visible.length;
+    more.hidden = remaining <= 0;
+    more.textContent = remaining > 0 ? 'Показать ещё 20 · осталось ' + remaining : '';
   }
 
   const inProgress = filtered.filter(isInProgress).sort(compareIncidents);
   const inProgressList = document.querySelector('#list-in-progress');
   const inProgressView = document.querySelector('#in-progress-view');
+  const inProgressVisible = inProgress.slice(0, state.groupVisible.inProgress);
   if (inProgressList) {
-    inProgressList.innerHTML = inProgress
+    inProgressList.innerHTML = inProgressVisible
       .map(incident => renderCard(incident, 'in-progress'))
       .join('');
+  }
+  let moreInProgress = document.querySelector('#more-in-progress');
+  if (!moreInProgress && inProgressList) {
+    moreInProgress = document.createElement('button');
+    moreInProgress.type = 'button';
+    moreInProgress.id = 'more-in-progress';
+    moreInProgress.className = 'button button-secondary group-more';
+    moreInProgress.setAttribute('aria-controls', 'list-in-progress');
+    moreInProgress.addEventListener('click', () => {
+      state.groupVisible.inProgress += 20;
+      render();
+    });
+    inProgressList.insertAdjacentElement('afterend', moreInProgress);
+  }
+  if (moreInProgress) {
+    const remaining = inProgress.length - inProgressVisible.length;
+    moreInProgress.hidden = remaining <= 0;
+    moreInProgress.textContent = remaining > 0 ? 'Показать ещё 20 · осталось ' + remaining : '';
   }
   setText('#group-count-in-progress', inProgress.length);
   setText('#in-progress-chip-count', inProgress.length);
@@ -2269,9 +2313,27 @@ function renderArchive() {
   const closed = state.incidents.filter(incident => incident.groups.includes('closed'));
   const filtered = getFilteredIncidents(closed).sort((a, b) => (b.resolvedAt ?? b.startedAt ?? 0) - (a.resolvedAt ?? a.startedAt ?? 0));
   const list = document.querySelector('#list-archive');
-  list.innerHTML = filtered.length
-    ? filtered.map(incident => renderCard(incident, 'archive')).join('')
+  const limit = state.groupVisible.archive ?? 20;
+  const visible = filtered.slice(0, limit);
+  list.innerHTML = visible.length
+    ? visible.map(incident => renderCard(incident, 'archive')).join('')
     : '<li class="empty-state">Завершённых инцидентов нет</li>';
+  let more = document.querySelector('#more-archive');
+  if (!more) {
+    more = document.createElement('button');
+    more.type = 'button';
+    more.id = 'more-archive';
+    more.className = 'button button-secondary group-more';
+    more.setAttribute('aria-controls', 'list-archive');
+    more.addEventListener('click', () => {
+      state.groupVisible.archive = (state.groupVisible.archive || 20) + 20;
+      render();
+    });
+    list.insertAdjacentElement('afterend', more);
+  }
+  const remaining = filtered.length - visible.length;
+  more.hidden = remaining <= 0;
+  more.textContent = remaining > 0 ? 'Показать ещё 20 · осталось ' + remaining : '';
   setText('#archive-count', filtered.length);
 }
 
@@ -3797,6 +3859,7 @@ function formatHistoryDetails(item) {
     case 'deadline':
       return details.deadline ? `→ ${fullDateTime.format(details.deadline)}` : 'Срок снят';
     case 'team':
+    case 'auto_team':
       return details.team ? `→ ${escapeHtml(details.team)}` : '';
     case 'status': {
       const status = stateLabel(details.stateId);
@@ -4368,6 +4431,7 @@ async function logout() {
   closeEvents();
   setUser(null);
   setWorkspaceView('our');
+  resetGroupVisibility();
   resetNotifications();
   resetTriage();
   state.incidents = [];

@@ -510,6 +510,19 @@ class Store {
     return Array.isArray(canonical.groups) ? canonical : null;
   }
 
+  activeSourceIds(caseId) {
+    return this.db.prepare('SELECT id, raw_json FROM raw_incidents WHERE case_id = ?').all(caseId)
+      .filter(row => {
+        try {
+          const raw = JSON.parse(row.raw_json);
+          return raw.stateId === 0 || raw.stateId === 2;
+        } catch {
+          return false;
+        }
+      })
+      .map(row => row.id);
+  }
+
   listCases() {
     return this.db.prepare('SELECT canonical_json FROM cases').all()
       .map(row => JSON.parse(row.canonical_json))

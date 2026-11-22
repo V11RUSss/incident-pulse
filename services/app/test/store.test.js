@@ -121,6 +121,20 @@ test('empty delta at the current revision does not rebuild cases or bump version
   assert.equal(store.getCurrentRevision(), 3);
 });
 
+test('activeSourceIds exposes only active source records of a mixed case', (t) => {
+  const store = tempStore(t);
+  store.applyDelta([
+    raw({ id: 'INC-ACTIVE', correlationKey: 'mixed', stateId: 0 }),
+    raw({
+      id: 'INC-CLOSED', correlationKey: 'mixed', stateId: 7, version: 2,
+      solution: 'исправлено', completionDate: '2026-01-02T00:00:00.000Z'
+    })
+  ], 1);
+  const incident = store.listCases()[0];
+  assert.equal(incident.sourceIds.length, 2);
+  assert.deepEqual(store.activeSourceIds(incident.caseId), ['INC-ACTIVE']);
+});
+
 test('markUnreadAssignmentsForCase clears older duplicates for the same case', (t) => {
   const store = tempStore(t);
   store.createUser(user('u1', 1));

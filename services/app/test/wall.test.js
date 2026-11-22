@@ -103,6 +103,7 @@ function startApp(dataDir, env = {}) {
       ITSM_MOCK_URL: 'http://127.0.0.1:1',
       POLL_INTERVAL_MS: '100',
       DEMO_GENERATION: 'true',
+      AUTO_ROUTING_ENABLED: 'false',
       DEMO_MIN_INTERVAL_MS: '1000',
       DEMO_MAX_INTERVAL_MS: '1000',
       DEMO_BATCH_MIN: '1',

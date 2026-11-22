@@ -54,6 +54,7 @@ function startApp(dataDir, env = {}) {
       ITSM_MOCK_URL: 'http://127.0.0.1:1',
       POLL_INTERVAL_MS: '100',
       DEMO_GENERATION: 'false',
+      AUTO_ROUTING_ENABLED: 'false',
       ...env
     },
     stdio: ['ignore', 'pipe', 'pipe']

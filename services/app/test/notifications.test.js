@@ -297,6 +297,7 @@ test('notification API and targeted SSE for coordinator assignment', { timeout: 
     PORT: '0',
     DATA_DIR: appDir,
     ITSM_MOCK_URL: mockUrl,
+    AUTO_ROUTING_ENABLED: 'false',
     POLL_INTERVAL_MS: '3600000',
     SESSION_TTL_MS: '600000'
   });

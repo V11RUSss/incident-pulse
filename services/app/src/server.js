@@ -11,6 +11,7 @@ const { Auth, AuthError } = require('./auth');
 const { AiClient, AiError } = require('./ai');
 const { askAssistant } = require('./assistant');
 const { suggestTeam } = require('./routing');
+const { ruleSuggestion } = require('../lib/routing');
 const { generatePostmortem } = require('./postmortem');
 const { buildDeterministicReport } = require('../lib/triage');
 const { scanTriage } = require('./triage');
@@ -96,6 +97,8 @@ const routingTimeoutMs = configuredInteger(process.env.ROUTING_TIMEOUT_MS, 20000
 const postmortemEnabled = process.env.POSTMORTEM_ENABLED !== 'false';
 const postmortemRateLimitPerMinute = configuredInteger(process.env.POSTMORTEM_RATE_LIMIT_PER_MIN, 10, 0);
 const postmortemTimeoutMs = configuredInteger(process.env.POSTMORTEM_TIMEOUT_MS, 60000, 1000);
+const autoRoutingEnabled = process.env.AUTO_ROUTING_ENABLED !== 'false';
+const autoRouteBatchLimit = configuredInteger(process.env.AUTO_ROUTE_BATCH_LIMIT, 50, 1);
 const triageEnabled = process.env.TRIAGE_ENABLED !== 'false';
 const triageAiEnabled = process.env.TRIAGE_AI_ENABLED !== 'false';
 const triageRateLimitPerMinute = configuredInteger(process.env.TRIAGE_AI_RATE_LIMIT_PER_MIN, 10, 0);
@@ -126,6 +129,7 @@ const postmortemCache = new Map();
 const triageUsage = new Map();
 const loginFailures = new Map();
 const registerUsage = new Map();
+const autoRouteBackoff = new Map();
 const REGISTER_LIMIT = 20;
 const REGISTER_WINDOW_MS = 60 * 60 * 1000;
 const store = new Store(DATA_DIR);
@@ -595,12 +599,76 @@ async function demoTickSafe() {
   }
 }
 
+async function autoRoutePass() {
+  if (!autoRoutingEnabled) return 0;
+  const candidates = store.listCases()
+    .filter(incident => incident.groups.includes('active') && !incident.team)
+    .slice(0, autoRouteBatchLimit);
+  const byTeam = new Map();
+  for (const incident of candidates) {
+    const activeIds = store.activeSourceIds(incident.caseId);
+    // Mixed active+closed/research cases need a human decision: patching all
+    // sourceIds would reopen the closed records and erase their solution.
+    if (!activeIds.length || activeIds.length !== incident.sourceIds.length) continue;
+    const suggestion = ruleSuggestion(incident);
+    if (!suggestion || !suggestion.team) continue;
+    const bucket = byTeam.get(suggestion.team) || [];
+    bucket.push({ incident, suggestion, activeIds });
+    byTeam.set(suggestion.team, bucket);
+  }
+  let routed = 0;
+  const now = Date.now();
+  for (const [team, bucket] of byTeam) {
+    if ((autoRouteBackoff.get(team) || 0) > now) continue;
+    const sourceIds = [...new Set(bucket.flatMap(item => item.activeIds))];
+    if (!sourceIds.length) continue;
+    try {
+      const result = await itsm.bulkUpdate(sourceIds, {
+        assignedGroupName: team,
+        stateId: 2,
+        solution: null,
+        completionDate: null
+      });
+      if (!result.updated) continue;
+      for (const item of bucket) {
+        store.recordHistory({
+          caseId: item.incident.caseId,
+          user: { id: null, name: 'Автоматическая маршрутизация' },
+          action: 'auto_team',
+          details: { team, source: 'rule', rationale: item.suggestion.rationale }
+        });
+      }
+      routed += bucket.length;
+      autoRouteBackoff.delete(team);
+    } catch (error) {
+      autoRouteBackoff.set(team, Date.now() + 60_000);
+      console.error('Автоматическая маршрутизация не удалась для команды ' + team, error);
+    }
+  }
+  return routed;
+}
+
 async function synchronize(source, generate = false) {
   const previousSyncError = store.getSyncState().syncError;
   try {
     const demo = generate && store.countActiveCases() < demoMaxActive ? await demoTickSafe() : null;
     const { delta, reset } = await loadDelta();
     const changes = store.applyDelta(delta.incidents, delta.revision);
+    const autoRouted = await autoRoutePass();
+    if (autoRouted) {
+      try {
+        const extra = await loadDelta();
+        const extraChanges = store.applyDelta(extra.delta.incidents, extra.delta.revision);
+        changes.revision = extraChanges.revision;
+        changes.lastSyncedAt = extraChanges.lastSyncedAt;
+        changes.syncError = extraChanges.syncError;
+        changes.rejected = extraChanges.rejected;
+      } catch (error) {
+        console.error('Не удалось применить автоматическую маршрутизацию', error);
+      }
+      changes.updated += autoRouted;
+      changes.autoRouted = autoRouted;
+    }
     if (reset) {
       broadcastSync({ type: 'sync.recovered', lastSyncedAt: changes.lastSyncedAt, reset: true });
     } else if (previousSyncError !== null) {
@@ -754,6 +822,11 @@ function checkOptionalExpectedVersion(body, incident) {
   if (expectedVersion !== incident.version) throw new ConflictError(incident);
 }
 
+function activeSourceIdsFor(incident) {
+  const active = store.activeSourceIds(incident.caseId);
+  return active.length ? active : incident.sourceIds;
+}
+
 async function claimCase(caseId, user, body) {
   return enqueue(async () => {
     const current = requiredCase(caseId);
@@ -765,7 +838,7 @@ async function claimCase(caseId, user, body) {
       throw new HttpError('Инцидент уже назначен другому координатору', 409, 'already_assigned');
     }
     if (current.coordinatorId === user.id) return { incident: current };
-    await itsm.bulkUpdate(current.sourceIds, { coordinatorId: user.id, coordinatorName: user.name });
+    await itsm.bulkUpdate(activeSourceIdsFor(current), { coordinatorId: user.id, coordinatorName: user.name });
     await synchronize('claim');
     store.recordHistory({
       caseId,
@@ -786,7 +859,7 @@ async function reassignCase(caseId, user, body) {
     const coordinator = store.getUserById(coordinatorId);
     if (!coordinator) throw new HttpError('Координатор не найден', 404);
     if (current.coordinatorId === coordinator.id) return { incident: current };
-    await itsm.bulkUpdate(current.sourceIds, {
+    await itsm.bulkUpdate(activeSourceIdsFor(current), {
       coordinatorId: coordinator.id,
       coordinatorName: coordinator.name
     });
@@ -815,7 +888,7 @@ async function setPriority(caseId, user, body) {
       throw new HttpError('Нельзя менять приоритет закрытого инцидента', 409, 'case_closed');
     }
     if (current.priorityOverrideId === priorityId) return { incident: current };
-    await itsm.bulkUpdate(current.sourceIds, { priorityOverrideId: priorityId });
+    await itsm.bulkUpdate(activeSourceIdsFor(current), { priorityOverrideId: priorityId });
     store.setPriorityOverride(caseId, priorityId);
     await synchronize('priority');
     store.recordHistory({
@@ -835,7 +908,7 @@ async function clearPriorityOverride(caseId, user) {
       throw new HttpError('Нельзя менять приоритет закрытого инцидента', 409, 'case_closed');
     }
     if (current.priorityOverrideId === null) return { incident: current };
-    await itsm.bulkUpdate(current.sourceIds, { priorityOverrideId: null });
+    await itsm.bulkUpdate(activeSourceIdsFor(current), { priorityOverrideId: null });
     store.setPriorityOverride(caseId, null);
     await synchronize('priority');
     store.recordHistory({
@@ -864,7 +937,7 @@ async function setDeadline(caseId, user, body) {
       throw new HttpError('Нельзя менять срок закрытого инцидента', 409, 'case_closed');
     }
     if (current.dueAt === deadlineMs) return { incident: current };
-    await itsm.bulkUpdate(current.sourceIds, { deadline });
+    await itsm.bulkUpdate(activeSourceIdsFor(current), { deadline });
     await synchronize('deadline');
     store.recordHistory({ caseId, user, action: 'deadline', details: { deadline: deadlineMs } });
     return { incident: requiredCase(caseId) };
@@ -884,7 +957,7 @@ async function setTeam(caseId, user, body) {
       throw new HttpError('Передать команду можно только активному инциденту', 409);
     }
     if (current.team === team && current.stateId === 2) return { incident: current };
-    await itsm.bulkUpdate(current.sourceIds, {
+    await itsm.bulkUpdate(activeSourceIdsFor(current), {
       assignedGroupName: team,
       stateId: 2,
       solution: null,
@@ -939,7 +1012,7 @@ async function setStatus(caseId, user, body) {
     }
 
     if (current.stateId === stateId && current.solution === solution) return { incident: current };
-    await itsm.bulkUpdate(current.sourceIds, patch);
+    await itsm.bulkUpdate(activeSourceIdsFor(current), patch);
     await synchronize('status');
     store.recordHistory({ caseId, user, action: 'status', details: { stateId, solution } });
     return { incident: requiredCase(caseId) };

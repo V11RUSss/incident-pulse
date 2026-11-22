@@ -539,6 +539,7 @@ function startApp(dataDir, env = {}) {
       ITSM_MOCK_URL: 'http://127.0.0.1:1',
       POLL_INTERVAL_MS: '3600000',
       TRIAGE_AI_RATE_LIMIT_PER_MIN: '1',
+      AUTO_ROUTING_ENABLED: 'false',
       ...env
     },
     stdio: ['ignore', 'pipe', 'pipe']

@@ -956,6 +956,7 @@ input, select, textarea { font: inherit; color: inherit; }
 
 .group-header h2 { font-size: 15px; }
 .group-header p { color: var(--muted); font-size: 12px; padding-inline-start: 19px; }
+.group-more { inline-size: 100%; margin-block-start: 8px; justify-content: center; }
 
 .group-count {
   display: inline-flex;

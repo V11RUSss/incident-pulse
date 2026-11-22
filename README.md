@@ -601,7 +601,8 @@ Content-Type: application/json
 - для активного инцидента без команды автоматически запрашивается одна
   рекомендация (только при открытии карточки, не в фоне);
 - показывается команда, одна строка обоснования и источник — `ИИ` или `правило`;
-- **ничего не назначается автоматически** — координатор жмёт «Назначить»;
+- в диалоге подсказка не применяется сама — координатор жмёт «Назначить»;
+- при этом фоновая авто-маршрутизация по правилам (`AUTO_ROUTING_ENABLED`, см. раздел ниже) может назначить команду и перевести кейс в `stateId=2` без открытия диалога — отключается через env;
 - «Другая» переводит фокус в ручной select;
 - если уверенной подсказки нет, блок просто скрыт.
 
@@ -801,7 +802,7 @@ rm -f "$COOKIE_JAR"
 | Сервис | Контейнер / хост | Основные настройки |
 | --- | --- | --- |
 | `itsm-mock` | `3001 / 8081` | `DATA_DIR=/data`, пустое начальное состояние на новом volume; порт по умолчанию публикуется только на `127.0.0.1` (`MOCK_BIND`), наружу не выставляйте. |
-| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true` (override), `AI_BASE_URL=http://127.0.0.1:8000/v1`, `AI_MODEL=qwen2.5-7b-awq`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `TRIAGE_ENABLED=true`, `TRIAGE_AI_ENABLED=true`, `TRIAGE_AI_RATE_LIMIT_PER_MIN=10`, `TRIAGE_AI_TIMEOUT_MS=20000`, `DEMO_MIN_INTERVAL_MS=3000`, `DEMO_MAX_INTERVAL_MS=9000`, `DEMO_BATCH_MIN=1`, `DEMO_BATCH_MAX=3`, `DEMO_MAX_ACTIVE=20`, `REGISTRATION_ENABLED=true` (override), `PUBLIC_ORIGIN=`, `COOKIE_SECURE=false` (override), `SESSION_TTL_MS=604800000` |
+| `app` | `3000 / 8080` | `STATIC_DIR=/web`, `ITSM_MOCK_URL=http://itsm-mock:3001`, `POLL_INTERVAL_MS=2000`, `DEMO_GENERATION=true` (override), `AI_BASE_URL=http://127.0.0.1:8000/v1`, `AI_MODEL=qwen2.5-7b-awq`, `AI_FALLBACK=true`, `AI_RATE_LIMIT_PER_MIN=10`, `ASSISTANT_ENABLED=true`, `ASSISTANT_RATE_LIMIT_PER_MIN=20`, `AUTO_ROUTING_ENABLED=true` (override), `AUTO_ROUTE_BATCH_LIMIT=50`, `ROUTING_ENABLED=true`, `ROUTING_RATE_LIMIT_PER_MIN=30`, `ROUTING_TIMEOUT_MS=20000`, `POSTMORTEM_ENABLED=true`, `POSTMORTEM_RATE_LIMIT_PER_MIN=10`, `POSTMORTEM_TIMEOUT_MS=60000`, `TRIAGE_ENABLED=true`, `TRIAGE_AI_ENABLED=true`, `TRIAGE_AI_RATE_LIMIT_PER_MIN=10`, `TRIAGE_AI_TIMEOUT_MS=20000`, `DEMO_MIN_INTERVAL_MS=3000`, `DEMO_MAX_INTERVAL_MS=9000`, `DEMO_BATCH_MIN=1`, `DEMO_BATCH_MAX=3`, `DEMO_MAX_ACTIVE=20`, `REGISTRATION_ENABLED=true` (override), `PUBLIC_ORIGIN=`, `COOKIE_SECURE=false` (override), `SESSION_TTL_MS=604800000` |
 
 `app` и `itsm-mock` собираются из корневого build context; локальный vLLM поднимается отдельными `docker-compose.vllm*.yml` только в `--mode=vllm`. `app` стартует после успешного healthcheck mock через `depends_on` с `service_healthy`; недоступный AI-бэкенд не блокирует запуск и уходит в AI-fallback.
 
@@ -832,3 +833,19 @@ http://localhost:8080/?view=assigned
 выберите получателя и нажмите «Переназначить»; в блоке «Команда МТС» —
 команду и «Назначить команду». Ссылка работает и после логина, если
 открыть её неавторизованным.
+
+### Автоназначение команды
+
+При синхронизации активный кейс без команды автоматически получает профильную
+команду по детерминированным правилам «продукт → команда» (без вызова AI):
+`AUTO_ROUTING_ENABLED=true` (по умолчанию), пакет до
+`AUTO_ROUTE_BATCH_LIMIT=50` кейсов за проход. Кейс переходит в
+`stateId=2`, в историю пишется `auto_team`, а в карточке появляется команда.
+Если правило не найдено, кейс остаётся в «На координаторов». Отключить:
+`AUTO_ROUTING_ENABLED=false`.
+
+### Очередь «На координаторов»
+
+Чтобы не рендерить тысячи карточек, колонка показывает первые 20 и кнопку
+**«Показать ещё N»** (по 20 за нажатие). Счётчик группы всегда показывает
+общее число; поиск/фильтры применяются до ограничения.

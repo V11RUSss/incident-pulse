@@ -15,17 +15,17 @@ const PRODUCT_RULES = Object.freeze([
   { keywords: ['cloud platform', 'api gateway', 'api-шлюз'], team: 'Cloud Platform / API Gateway', rationale: 'Сценарий связан с Cloud Platform / API Gateway.' },
   { keywords: ['digital', 'цифровые каналы', 'сайт', 'приложение'], team: 'Digital-каналы', rationale: 'Сценарий относится к цифровым каналам.' },
   { keywords: ['биллинг', 'billing', 'расчёт', 'расчет', 'платеж', 'платёж'], team: 'Расчёты и биллинг', rationale: 'Сценарий относится к расчётам и биллингу.' },
-  { keywords: ['эксплуатация сети', 'сеть', 'регион'], team: 'Эксплуатация сети / Регион', rationale: 'Сценарий относится к эксплуатации сети или региону.' },
+  { keywords: ['эксплуатация сети'], team: 'Эксплуатация сети / Регион', rationale: 'Сценарий относится к эксплуатации сети.' },
   { keywords: ['платформа идентификации', 'идентификация'], team: 'Платформа идентификации', rationale: 'Сценарий относится к платформе идентификации.' }
 ]);
 
 const SCENARIO_RULES = Object.freeze([
-  { keywords: ['авторизац', 'аутентификац', 'вход', 'логин', 'парол'], team: 'Платформа идентификации', rationale: 'Сценарий авторизации относится к платформе идентификации.' },
+  { keywords: ['авторизац', 'аутентификац', 'логин', 'парол'], team: 'Платформа идентификации', rationale: 'Сценарий авторизации относится к платформе идентификации.' },
   { keywords: ['видео', 'стрим', 'воспроизвед'], team: 'МТС ИТ Поддержка KION', rationale: 'Сценарий связан с воспроизведением видео KION.' },
   { keywords: ['api', 'шлюз', 'gateway'], team: 'Cloud Platform / API Gateway', rationale: 'Сценарий связан с API Gateway.' },
   { keywords: ['биллинг', 'платеж', 'платёж', 'расчёт', 'расчет'], team: 'Расчёты и биллинг', rationale: 'Сценарий связан с расчётами и биллингом.' },
   { keywords: ['сайт', 'приложение', 'личный кабинет'], team: 'Digital-каналы', rationale: 'Сценарий связан с цифровыми каналами.' },
-  { keywords: ['сеть', 'регион', 'базовая станция'], team: 'Эксплуатация сети / Регион', rationale: 'Сценарий связан с сетью или регионом.' }
+  { keywords: ['базовая станция'], team: 'Эксплуатация сети / Регион', rationale: 'Сценарий связан с сетевой инфраструктурой.' }
 ]);
 
 class RoutingError extends Error {
@@ -41,11 +41,18 @@ function normalize(value) {
   return String(value || '').toLocaleLowerCase('ru').replace(/\s+/g, ' ').trim();
 }
 
+function matchesKeyword(value, keyword) {
+  const normalized = normalize(keyword);
+  if (!normalized) return false;
+  const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp('(^|[^\\p{L}\\p{N}])' + escaped, 'iu').test(value);
+}
+
 function findRule(incident, rules, field) {
   const value = normalize(incident[field]);
   if (!value) return null;
   for (const rule of rules) {
-    if (rule.keywords.some(keyword => value.includes(normalize(keyword)))) return rule;
+    if (rule.keywords.some(keyword => matchesKeyword(value, keyword))) return rule;
   }
   return null;
 }
